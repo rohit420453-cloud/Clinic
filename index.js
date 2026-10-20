@@ -393,6 +393,8 @@ export async function getDb() {
       client: null,
       dbPromise: null,
       initialized: false,
+      lastConnectionReason: 'Not initialized',
+      mongoUriConfigured: false,
     };
   }
   const cache = globalThis.__smilecraftMongoCache;
@@ -403,6 +405,7 @@ export async function getDb() {
       (uri.startsWith('mongodb://') || uri.startsWith('mongodb+srv://')) &&
       !uri.includes('<username>') &&
       !uri.includes('MY_MONGODB_URI');
+    cache.mongoUriConfigured = isRealMongoUri;
 
     if (isRealMongoUri) {
       cache.dbPromise = (async () => {
@@ -419,8 +422,13 @@ export async function getDb() {
           await initializeDatabase(atlasDb);
           cache.client = client;
           cache.initialized = true;
+          cache.lastConnectionReason = 'Connected to MongoDB Atlas (' + MONGODB_DB_NAME + ')';
           return atlasDb;
         } catch (err) {
+          cache.lastConnectionReason =
+            'MongoDB Atlas fallback active (' +
+            (err?.message ? String(err.message).slice(0, 120) : 'connection failed') +
+            ')';
           if (process.env.STRICT_DB_ONLY === 'true') {
             throw err;
           }
@@ -433,6 +441,9 @@ export async function getDb() {
     } else if (process.env.STRICT_DB_ONLY === 'true') {
       throw new Error('MONGODB_URI environment variable is missing or unconfigured.');
     } else {
+      cache.lastConnectionReason = uri
+        ? 'MONGODB_URI has placeholder values; using Built-in Embedded Database'
+        : 'MONGODB_URI not set; using Built-in Embedded Database';
       cache.dbPromise = (async () => {
         const embeddedDb = createEmbeddedDatabase();
         await initializeDatabase(embeddedDb);
@@ -1059,6 +1070,17 @@ const publicWriteLimiter = rateLimit({
 app.get('/api/health', async (req, res) => {
   try {
     const db = await getDb();
+    const cache = globalThis.__smilecraftMongoCache || {};
+    const collections = [
+      'appointments',
+      'slot_reservations',
+      'services',
+      'dentists',
+      'availability_rules',
+      'blocked_slots',
+      'inquiries',
+      'admins',
+    ];
     return res.json({
       success: true,
       message: 'SmileCraft Dental Studio service is healthy.',
@@ -1067,7 +1089,11 @@ app.get('/api/health', async (req, res) => {
         clinicName: 'SmileCraft Dental Studio',
         timezone: CLINIC_TIMEZONE,
         clinicDate: getTodayDateString(),
+        databaseName: MONGODB_DB_NAME,
         storageEngine: db.__isEmbedded ? 'embedded-mongo-compatible' : 'mongodb-atlas',
+        mongoUriConfigured: Boolean(cache.mongoUriConfigured),
+        connectionDetail: cache.lastConnectionReason || 'Ready',
+        collections,
       },
     });
   } catch (err) {
