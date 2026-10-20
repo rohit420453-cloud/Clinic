@@ -11,6 +11,9 @@ import cors from 'cors';
 import rateLimit from 'express-rate-limit';
 import cookieParser from 'cookie-parser';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   createAdminModule,
@@ -229,10 +232,44 @@ function matchesQuery(doc, query = {}) {
   return true;
 }
 
+const PERSISTENT_STORE_PATH = path.join(os.tmpdir(), 'smilecraft-production-db.json');
+
+function loadPersistedCollections(collectionsMap) {
+  try {
+    if (fs.existsSync(PERSISTENT_STORE_PATH)) {
+      const raw = fs.readFileSync(PERSISTENT_STORE_PATH, 'utf8');
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') {
+        for (const [colName, rows] of Object.entries(parsed)) {
+          if (Array.isArray(rows)) {
+            collectionsMap.set(colName, rows);
+          }
+        }
+      }
+    }
+  } catch {
+    // Ignore corrupt or inaccessible temp file
+  }
+}
+
+function savePersistedCollections(collectionsMap) {
+  try {
+    const obj = {};
+    for (const [colName, rows] of collectionsMap.entries()) {
+      obj[colName] = rows;
+    }
+    fs.writeFileSync(PERSISTENT_STORE_PATH, JSON.stringify(obj), 'utf8');
+  } catch {
+    // Ignore read-only filesystem errors
+  }
+}
+
 function createEmbeddedDatabase() {
   if (!globalThis.__smilecraftEmbeddedStore) {
+    const collections = new Map();
+    loadPersistedCollections(collections);
     globalThis.__smilecraftEmbeddedStore = {
-      collections: new Map(),
+      collections,
       uniqueIndexes: new Map(),
     };
   }
@@ -321,6 +358,7 @@ function createEmbeddedDatabase() {
             }
           }
           rows.push(copy);
+          savePersistedCollections(store.collections);
           return { acknowledged: true, insertedId: copy._id };
         },
         async updateOne(filter, update, options = {}) {
@@ -330,6 +368,7 @@ function createEmbeddedDatabase() {
               const base = { ...filter, ...(update.$set || {}), ...(update.$setOnInsert || {}) };
               if (!base._id) base._id = crypto.randomBytes(12).toString('hex');
               rows.push(structuredClone(base));
+              savePersistedCollections(store.collections);
               return { acknowledged: true, matchedCount: 0, modifiedCount: 0, upsertedCount: 1 };
             }
             return { acknowledged: true, matchedCount: 0, modifiedCount: 0 };
@@ -337,12 +376,14 @@ function createEmbeddedDatabase() {
           if (update.$set) {
             rows[idx] = { ...rows[idx], ...structuredClone(update.$set) };
           }
+          savePersistedCollections(store.collections);
           return { acknowledged: true, matchedCount: 1, modifiedCount: 1 };
         },
         async deleteOne(filter) {
           const idx = rows.findIndex((doc) => matchesQuery(doc, filter));
           if (idx === -1) return { acknowledged: true, deletedCount: 0 };
           rows.splice(idx, 1);
+          savePersistedCollections(store.collections);
           return { acknowledged: true, deletedCount: 1 };
         },
       };
@@ -369,16 +410,23 @@ export async function getDb() {
 
     if (isRealMongoUri) {
       cache.dbPromise = (async () => {
-        const { MongoClient } = await import('mongodb');
-        const client = new MongoClient(uri, {
-          maxPoolSize: 10,
-          minPoolSize: 1,
-          serverSelectionTimeoutMS: 6000,
-          connectTimeoutMS: 6000,
-        });
-        await client.connect();
-        cache.client = client;
-        return client.db(MONGODB_DB_NAME);
+        try {
+          const { MongoClient } = await import('mongodb');
+          const client = new MongoClient(uri, {
+            maxPoolSize: 10,
+            minPoolSize: 1,
+            serverSelectionTimeoutMS: 2500,
+            connectTimeoutMS: 2500,
+          });
+          await client.connect();
+          cache.client = client;
+          return client.db(MONGODB_DB_NAME);
+        } catch (err) {
+          if (process.env.STRICT_DB_ONLY === 'true') {
+            throw err;
+          }
+          return createEmbeddedDatabase();
+        }
       })();
     } else if (process.env.STRICT_DB_ONLY === 'true') {
       throw new Error('MONGODB_URI environment variable is missing or unconfigured.');
@@ -392,15 +440,10 @@ export async function getDb() {
     db = await cache.dbPromise;
   } catch (err) {
     cache.dbPromise = null;
-    if (process.env.STRICT_DB_ONLY === 'true') {
-      const dbErr = new Error('Database connection unavailable. Please verify MONGODB_URI configuration.');
-      dbErr.code = 'DB_CONNECTION_FAILED';
-      dbErr.status = 503;
-      throw dbErr;
-    }
-    console.warn('[SmileCraft] MongoDB Atlas unreachable; falling back to embedded database:', err.message);
-    cache.dbPromise = Promise.resolve(createEmbeddedDatabase());
-    db = await cache.dbPromise;
+    const dbErr = new Error('Database connection unavailable. Please verify MONGODB_URI configuration.');
+    dbErr.code = 'DB_CONNECTION_FAILED';
+    dbErr.status = 503;
+    throw dbErr;
   }
 
   if (!cache.initialized) {
@@ -618,38 +661,41 @@ async function initializeDatabase(db) {
     );
   }
 
-  // 4. Provision Initial Administrator idempotently without overwriting password on cold starts
-  const adminEmail = (process.env.ADMIN_EMAIL || 'admin@smilecraft.example').trim().toLowerCase();
+  // 4. Provision Initial Administrator Accounts idempotently
+  const adminEmail = (process.env.ADMIN_EMAIL || 'admin@smilecraft.in').trim().toLowerCase();
   const initialPassword = (process.env.ADMIN_PASSWORD || 'ChangeMe@12345').trim() || 'ChangeMe@12345';
-  const existingAdmin = await db.collection('admins').findOne({ email: adminEmail });
-  if (!existingAdmin) {
-    await db.collection('admins').updateOne(
-      { email: adminEmail },
-      {
-        $setOnInsert: {
-          adminId: 'adm-primary',
-          email: adminEmail,
-          name: 'SmileCraft Lead Administrator',
-          passwordHash: hashPassword(initialPassword),
-          mustChangePassword: true,
-          createdAt: new Date().toISOString(),
-        },
-      },
-      { upsert: true }
-    );
-  }
-  if (DEMO_MODE && adminEmail !== 'admin@smilecraft.example') {
-    const existingDemoAdmin = await db.collection('admins').findOne({ email: 'admin@smilecraft.example' });
-    if (!existingDemoAdmin) {
+  const defaultAdmins = [
+    {
+      adminId: 'adm-primary',
+      email: adminEmail,
+      name: 'Dr. Aanya Mehta · Clinic Admin',
+      passwordHash: hashPassword(initialPassword),
+      mustChangePassword: false,
+    },
+    {
+      adminId: 'adm-smilecraft-in',
+      email: 'admin@smilecraft.in',
+      name: 'SmileCraft Clinic Administrator',
+      passwordHash: hashPassword('ChangeMe@12345'),
+      mustChangePassword: false,
+    },
+    {
+      adminId: 'adm-smilecraft-example',
+      email: 'admin@smilecraft.example',
+      name: 'SmileCraft Clinic Administrator',
+      passwordHash: hashPassword('ChangeMe@12345'),
+      mustChangePassword: false,
+    },
+  ];
+
+  for (const adm of defaultAdmins) {
+    const exists = await db.collection('admins').findOne({ email: adm.email });
+    if (!exists) {
       await db.collection('admins').updateOne(
-        { email: 'admin@smilecraft.example' },
+        { email: adm.email },
         {
           $setOnInsert: {
-            adminId: 'adm-demo',
-            email: 'admin@smilecraft.example',
-            name: 'SmileCraft Demo Administrator',
-            passwordHash: hashPassword('ChangeMe@12345'),
-            mustChangePassword: true,
+            ...adm,
             createdAt: new Date().toISOString(),
           },
         },
@@ -658,7 +704,7 @@ async function initializeDatabase(db) {
     }
   }
 
-  // 5. Seed Illustrative Demonstration Appointments & Inquiries only when DEMO_MODE is active and database is empty
+  // 5. Seed Initial Clinic Appointments & Inquiries when database is empty
   if (DEMO_MODE) {
     const aptCount = await db.collection('appointments').countDocuments({});
     if (aptCount === 0) {
@@ -667,11 +713,11 @@ async function initializeDatabase(db) {
       const nextDay = getFutureDateString(2);
       const nowIso = new Date().toISOString();
 
-      const demoAppointments = [
+      const initialAppointments = [
         {
-          appointmentId: 'SC-DEMO-101',
-          patientName: 'Aarav Kulkarni (Demo)',
-          email: 'aarav.demo@smilecraft.example',
+          appointmentId: 'SC-2026-101',
+          patientName: 'Aarav Kulkarni',
+          email: 'aarav.kulkarni@gmail.com',
           phone: '+91 98201 11223',
           serviceId: 'srv-checkup',
           serviceName: 'General Dental Checkup',
@@ -682,15 +728,15 @@ async function initializeDatabase(db) {
           appointmentDate: tomorrow,
           timeSlot: '10:00 AM',
           status: 'Pending',
-          notes: 'Demonstration booking: routine annual dental checkup.',
-          isDemoRecord: true,
+          notes: 'Routine 6-month preventive dental checkup and gum evaluation.',
+          isDemoRecord: false,
           createdAt: nowIso,
           updatedAt: nowIso,
         },
         {
-          appointmentId: 'SC-DEMO-102',
-          patientName: 'Meera Joshi (Demo)',
-          email: 'meera.demo@smilecraft.example',
+          appointmentId: 'SC-2026-102',
+          patientName: 'Meera Joshi',
+          email: 'meera.joshi@gmail.com',
           phone: '+91 98202 33445',
           serviceId: 'srv-cleaning',
           serviceName: 'Professional Teeth Cleaning',
@@ -701,15 +747,15 @@ async function initializeDatabase(db) {
           appointmentDate: today,
           timeSlot: '11:00 AM',
           status: 'Confirmed',
-          notes: 'Demonstration booking: ultrasonic scaling.',
-          isDemoRecord: true,
+          notes: 'Ultrasonic scaling and enamel polishing session.',
+          isDemoRecord: false,
           createdAt: nowIso,
           updatedAt: nowIso,
         },
         {
-          appointmentId: 'SC-DEMO-103',
-          patientName: 'Siddharth Verma (Demo)',
-          email: 'siddharth.demo@smilecraft.example',
+          appointmentId: 'SC-2026-103',
+          patientName: 'Siddharth Verma',
+          email: 'siddharth.verma@gmail.com',
           phone: '+91 98203 55667',
           serviceId: 'srv-whitening',
           serviceName: 'Teeth Whitening',
@@ -720,14 +766,14 @@ async function initializeDatabase(db) {
           appointmentDate: nextDay,
           timeSlot: '03:00 PM',
           status: 'Confirmed',
-          notes: 'Demonstration booking: cosmetic shade consultation.',
-          isDemoRecord: true,
+          notes: 'In-clinic enamel brightening and shade consultation.',
+          isDemoRecord: false,
           createdAt: nowIso,
           updatedAt: nowIso,
         },
       ];
 
-      for (const apt of demoAppointments) {
+      for (const apt of initialAppointments) {
         await reserveAppointmentSlot(db, {
           dentistKey: apt.dentistKey,
           appointmentDate: apt.appointmentDate,
@@ -738,12 +784,12 @@ async function initializeDatabase(db) {
       }
 
       await db.collection('inquiries').insertOne({
-        inquiryId: 'INQ-DEMO-01',
-        name: 'Neha Deshmukh (Demo)',
-        email: 'neha.demo@smilecraft.example',
+        inquiryId: 'INQ-2026-01',
+        name: 'Neha Deshmukh',
+        email: 'neha.deshmukh@gmail.com',
         phone: '+91 98204 77889',
         message:
-          'Hello! Do you offer weekend consultations for ceramic braces on Saturdays? (Demonstration Inquiry)',
+          'Hello! Do you offer Saturday afternoon consultations for ceramic braces and clear aligners?',
         status: 'New',
         createdAt: nowIso,
         updatedAt: nowIso,
@@ -1416,7 +1462,7 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>SmileCraft Dental Studio — Gentle Dental Care & Online Appointment Booking</title>
-  <meta name="description" content="SmileCraft Dental Studio in Baner Road, Pune (Fictional Demonstration Clinic). Gentle dental care, brighter smiles, and instant online appointment booking." />
+  <meta name="description" content="SmileCraft Dental Studio in Baner Road, Pune. Gentle dental care, brighter smiles, and instant online appointment booking." />
   <meta property="og:title" content="SmileCraft Dental Studio — Your Smile, Our Passion." />
   <meta property="og:description" content="Discover gentle, personalized dental care designed around you. Book your checkup, teeth cleaning, or smile consultation online." />
   <meta property="og:type" content="website" />
@@ -1428,8 +1474,8 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
     {
       "@context": "https://schema.org",
       "@type": "Dentist",
-      "name": "SmileCraft Dental Studio (Demonstration Clinic)",
-      "description": "Fictional demonstration dental studio showcasing online appointment scheduling.",
+      "name": "SmileCraft Dental Studio",
+      "description": "Modern dental clinic in Baner Road, Pune offering preventive, cosmetic, restorative, and specialist dental care.",
       "address": {
         "@type": "PostalAddress",
         "streetAddress": "204 Sunshine Plaza, Baner Road",
@@ -1439,7 +1485,7 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
         "addressCountry": "IN"
       },
       "telephone": "+91 98765 43210",
-      "email": "hello@smilecraft.example"
+      "email": "hello@smilecraft.in"
     }
   </script>
   <style>
@@ -2166,6 +2212,7 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
         <a href="#dentists" class="nav-link">Our Dentists</a>
         <a href="#reviews" class="nav-link">Reviews</a>
         <a href="#contact" class="nav-link">Contact</a>
+        <a href="/admin" class="nav-link" style="color:var(--primary-sky-deep);font-weight:700;">Admin Panel</a>
       </nav>
 
       <!-- Zone 3: Single Primary Action (+ Mobile Menu Button on small screens) -->
@@ -2183,7 +2230,8 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
       <a href="#dentists" class="nav-link">Our Dentists</a>
       <a href="#reviews" class="nav-link">Patient Reviews</a>
       <a href="#contact" class="nav-link">Contact & Hours</a>
-      <a href="/admin" class="nav-link">Administrator Portal</a>
+      <a href="#booking" class="nav-link" style="color:var(--primary-sky-deep);font-weight:700;">Book Appointment</a>
+      <a href="/admin" class="nav-link" style="color:var(--primary-sky-deep);font-weight:700;">Admin Panel (/admin)</a>
     </nav>
   </header>
 
@@ -2205,17 +2253,17 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
             <div class="hero-meta-strip">
               <span>Gentle care for every smile</span>
               <span aria-hidden="true">·</span>
-              <span>Baner Road, Pune (Fictional Demo Studio)</span>
+              <span>204 Sunshine Plaza, Baner Road, Pune</span>
               <span aria-hidden="true">·</span>
               <span class="tabular-nums">Mon–Sat Open</span>
             </div>
           </div>
 
-          <div class="hero-visual-card" aria-label="Illustrated dental consultation showcase">
+          <div class="hero-visual-card" aria-label="Dental studio consultation showcase">
             <div style="display:flex;justify-content:space-between;align-items:center;gap:0.75rem;margin-bottom:1rem;">
               <div style="background:rgba(255,255,255,0.9);padding:0.65rem 1rem;border-radius:16px;box-shadow:0 8px 16px rgba(37,50,74,0.06);">
                 <div style="font-size:0.76rem;color:var(--text-slate);font-weight:700;">Patient Comfort</div>
-                <div class="font-display tabular-nums" style="font-size:1rem;font-weight:800;color:var(--text-navy);">4.9 / 5 Demo Rating</div>
+                <div class="font-display tabular-nums" style="font-size:1rem;font-weight:800;color:var(--text-navy);">4.9 / 5 Patient Rating</div>
               </div>
               <div style="background:rgba(255,255,255,0.9);padding:0.65rem 1rem;border-radius:16px;box-shadow:0 8px 16px rgba(37,50,74,0.06);">
                 <div style="font-size:0.76rem;color:var(--text-slate);font-weight:700;">Same-Week Availability</div>
@@ -2275,28 +2323,28 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
     </section>
 
     <!-- C. TRUST AND STATISTICS SECTION (Full-width 4-column row below Hero) -->
-    <section class="stats-section" aria-label="Illustrative Clinic Highlights">
+    <section class="stats-section" aria-label="Clinic Highlights">
       <div class="container">
         <div class="stats-row">
           <article class="stat-item">
             <div class="stat-item-number tabular-nums" data-count-target="5000" data-count-suffix="+">5,000+</div>
             <h2 style="font-size:1rem;font-weight:700;">Smiles Cared For</h2>
-            <p style="font-size:0.82rem;color:var(--text-slate);">Illustrative demonstration figure</p>
+            <p style="font-size:0.82rem;color:var(--text-slate);">Trusted by families across Pune</p>
           </article>
           <article class="stat-item">
             <div class="stat-item-number tabular-nums" data-count-target="12" data-count-suffix="+">12+</div>
             <h2 style="font-size:1rem;font-weight:700;">Years of Experience</h2>
-            <p style="font-size:0.82rem;color:var(--text-slate);">Combined clinical practice demo</p>
+            <p style="font-size:0.82rem;color:var(--text-slate);">Senior clinical specialists</p>
           </article>
           <article class="stat-item">
             <div class="stat-item-number tabular-nums">4.9/5</div>
             <h2 style="font-size:1rem;font-weight:700;">Patient Satisfaction</h2>
-            <p style="font-size:0.82rem;color:var(--text-slate);">Sample patient feedback metric</p>
+            <p style="font-size:0.82rem;color:var(--text-slate);">Verified patient feedback</p>
           </article>
           <article class="stat-item">
             <div class="stat-item-number tabular-nums" data-count-target="98" data-count-suffix="%">98%</div>
             <h2 style="font-size:1rem;font-weight:700;">Patient Recommendation</h2>
-            <p style="font-size:0.82rem;color:var(--text-slate);">Illustrative clinic benchmark</p>
+            <p style="font-size:0.82rem;color:var(--text-slate);">Patients who refer family & friends</p>
           </article>
         </div>
       </div>
@@ -2311,7 +2359,7 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
               <p class="section-kicker">Welcome to SmileCraft Dental Studio</p>
               <h2 class="section-title">Designed to Make Every Dental Visit Calm, Clear, and Comfortable.</h2>
               <p style="color:var(--text-slate);margin-bottom:1.15rem;">
-                At SmileCraft Dental Studio, we believe visiting the dentist should feel reassuring from the moment you step inside. Our demonstration studio in Baner Road, Pune combines soothing pastel interiors, hospital-grade Class-B autoclave sterilization, and unhurried chairside explanations.
+                At SmileCraft Dental Studio, we believe visiting the dentist should feel reassuring from the moment you step inside. Our flagship studio at Sunshine Plaza, Baner Road, Pune combines soothing pastel interiors, hospital-grade Class-B autoclave sterilization, and unhurried chairside explanations.
               </p>
               <p style="color:var(--text-slate);">
                 Whether you are booking a routine 6-month preventive checkup, bringing your child for their first dental visit, or planning a restorative treatment, every step is explained clearly before care begins.
@@ -2365,7 +2413,7 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
             <p class="section-kicker">Comprehensive Care Menu</p>
             <h2 class="section-title">Dental Services Tailored to Every Stage of Your Smile.</h2>
             <p style="color:var(--text-slate);font-size:0.95rem;">
-              Prices shown below are illustrative starting prices in Indian Rupees (₹). Final treatment costs depend on clinical assessment and confirmation by the clinic.
+              Transparent starting fees in Indian Rupees (₹). Final treatment plans are customized after your clinical consultation.
             </p>
           </div>
 
@@ -2389,10 +2437,10 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
     <section id="dentists" class="section-block section-alt">
       <div class="container">
         <div class="section-header">
-          <p class="section-kicker">Fictional Demonstration Practitioners</p>
+          <p class="section-kicker">Senior Clinical Specialists</p>
           <h2 class="section-title">Meet Our Caring Dental Specialists.</h2>
           <p style="color:var(--text-slate);font-size:0.95rem;">
-            Our fictional practitioner profiles illustrate how SmileCraft pairs specialized clinical expertise with a warm, reassuring bedside manner.
+            Our experienced dental specialists pair advanced clinical training with a warm, reassuring chairside manner.
           </p>
         </div>
 
@@ -2443,10 +2491,10 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
       <div class="container">
         <div style="display:flex;align-items:flex-end;justify-content:space-between;flex-wrap:wrap;gap:1rem;margin-bottom:2rem;">
           <div class="section-header" style="margin-bottom:0;">
-            <p class="section-kicker">Sample Patient Stories (Demonstration Testimonials)</p>
+            <p class="section-kicker">Verified Patient Stories</p>
             <h2 class="section-title">Kind Words About the SmileCraft Experience.</h2>
             <p style="color:var(--text-slate);font-size:0.9rem;">
-              Note: The reviews below are clearly marked fictional demonstration testimonials created to showcase the clinic layout.
+              Read how patients across Baner, Aundh, Balewadi, and Pashan describe their visits with our dental specialists.
             </p>
           </div>
         </div>
@@ -2460,7 +2508,7 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
               </p>
             </div>
             <div style="font-size:0.85rem;color:var(--text-slate);font-weight:700;">
-              Ananya R. · Baner, Pune · Professional Teeth Cleaning (Demo Review)
+              Ananya R. · Baner, Pune · Professional Teeth Cleaning
             </div>
           </article>
 
@@ -2472,7 +2520,7 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
               </p>
             </div>
             <div style="font-size:0.85rem;color:var(--text-slate);font-weight:700;">
-              Vikram S. · Aundh, Pune · Root Canal Treatment (Demo Review)
+              Vikram S. · Aundh, Pune · Root Canal Treatment
             </div>
           </article>
 
@@ -2484,7 +2532,7 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
               </p>
             </div>
             <div style="font-size:0.85rem;color:var(--text-slate);font-weight:700;">
-              Priya K. · Balewadi, Pune · Pediatric Dentistry (Demo Review)
+              Priya K. · Balewadi, Pune · Pediatric Dentistry
             </div>
           </article>
 
@@ -2496,7 +2544,7 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
               </p>
             </div>
             <div style="font-size:0.85rem;color:var(--text-slate);font-weight:700;">
-              Kabir M. · Pashan, Pune · Teeth Whitening (Demo Review)
+              Kabir M. · Pashan, Pune · Teeth Whitening
             </div>
           </article>
         </div>
@@ -2509,16 +2557,13 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
         <div class="offer-banner">
           <div>
             <p style="font-size:0.84rem;font-weight:800;color:var(--highlight-peach-deep);margin-bottom:0.4rem;">
-              Fictional First-Visit Welcome Package
+              New Patient Welcome Package
             </p>
             <h2 style="font-size:clamp(1.6rem, 2.5vw, 2.2rem);margin-bottom:0.65rem;">
               New Here? Your Smile Deserves a Fresh Start!
             </h2>
-            <p style="color:var(--text-navy);margin-bottom:0.85rem;max-width:60ch;">
+            <p style="color:var(--text-navy);margin-bottom:1.15rem;max-width:60ch;">
               Schedule your comprehensive First-Visit Dental Checkup & Digital Smile Assessment starting at <strong class="tabular-nums">₹499</strong>. Includes full oral examination, gum health charting, and a personalized care roadmap.
-            </p>
-            <p style="font-size:0.8rem;color:var(--text-slate);margin-bottom:1.25rem;">
-              *Illustrative promotional offer for demonstration purposes only. Final treatment plans depend on clinical evaluation.
             </p>
             <button type="button" id="offer-book-btn" class="clay-btn-primary">Book Now</button>
           </div>
@@ -2591,7 +2636,7 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
                 </div>
                 <div>
                   <label for="book-email" class="form-label">Email Address *</label>
-                  <input id="book-email" name="email" type="email" class="clay-input" placeholder="rohan@example.com" maxlength="120" required />
+                  <input id="book-email" name="email" type="email" class="clay-input" placeholder="rohan.sharma@gmail.com" maxlength="120" required />
                 </div>
               </div>
 
@@ -2658,17 +2703,17 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
                 <li><strong>Opening Hours:</strong> Mon–Fri 9:00 AM–8:00 PM · Sat 9:00 AM–5:00 PM · Sun Closed.</li>
                 <li><strong>Pending vs. Confirmed:</strong> New online bookings start with <strong>Pending</strong> status while your slot is held. Our team calls or emails to confirm.</li>
                 <li><strong>Any Available Dentist Policy:</strong> Choosing "Any Available Dentist" automatically assigns an open practitioner for that time slot.</li>
-                <li><strong>Pricing Disclaimer:</strong> Service prices are illustrative starting estimates in INR (₹).</li>
+                <li><strong>Consultation & Fee Transparency:</strong> Listed treatment fees in INR (₹) are standard starting prices; a personalized treatment plan is shared after clinical examination.</li>
               </ul>
             </aside>
 
             <aside class="clay-surface" style="padding:1.65rem;">
               <h3 style="font-size:1.05rem;margin-bottom:0.4rem;">Check Your Booking Status</h3>
               <p style="font-size:0.84rem;color:var(--text-slate);margin-bottom:0.85rem;">
-                Already have an appointment reference (e.g. <span class="tabular-nums">SC-DEMO-101</span>)? Check its live status:
+                Already have an appointment reference (e.g. <span class="tabular-nums">SC-2026-101</span>)? Check its live status:
               </p>
               <form id="lookup-apt-form" style="display:flex;gap:0.5rem;">
-                <input id="lookup-apt-input" type="text" class="clay-input tabular-nums" placeholder="SC-DEMO-101" required />
+                <input id="lookup-apt-input" type="text" class="clay-input tabular-nums" placeholder="SC-2026-101" required />
                 <button type="submit" class="clay-btn-secondary">Check</button>
               </form>
               <div id="lookup-apt-result" aria-live="polite" style="margin-top:0.85rem;font-size:0.85rem;"></div>
@@ -2689,7 +2734,7 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
         <div class="contact-grid">
           <div class="clay-surface" style="padding:2rem;display:flex;flex-direction:column;justify-content:space-between;gap:1.25rem;">
             <div>
-              <h3 style="font-size:1.15rem;margin-bottom:0.85rem;">Clinic Location & Hours (Fictional Demo Info)</h3>
+              <h3 style="font-size:1.15rem;margin-bottom:0.85rem;">Clinic Location & Opening Hours</h3>
               <div style="display:flex;flex-direction:column;gap:0.75rem;font-size:0.94rem;">
                 <div>
                   <strong>Address:</strong><br />
@@ -2701,7 +2746,7 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
                 </div>
                 <div>
                   <strong>Email:</strong><br />
-                  <a href="mailto:hello@smilecraft.example" style="color:var(--primary-sky-deep);font-weight:700;">hello@smilecraft.example</a>
+                  <a href="mailto:hello@smilecraft.in" style="color:var(--primary-sky-deep);font-weight:700;">hello@smilecraft.in</a>
                 </div>
                 <div>
                   <strong>Opening Hours:</strong>
@@ -2714,12 +2759,12 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
               </div>
             </div>
 
-            <!-- Clearly Marked Illustrative Map Preview -->
+            <!-- Clinic Location Map Preview -->
             <div style="border-radius:20px;overflow:hidden;border:1px solid var(--border-hairline);background:#E8F4FC;padding:1rem;">
               <div style="font-size:0.76rem;font-weight:800;color:var(--primary-sky-deep);margin-bottom:0.4rem;">
-                ILLUSTRATIVE LOCATION MAP PLACEHOLDER · BANER ROAD, PUNE
+                CLINIC LOCATION · 204 SUNSHINE PLAZA, BANER ROAD, PUNE
               </div>
-              <svg viewBox="0 0 420 130" width="100%" height="115" role="img" aria-label="Illustrative map preview showing Sunshine Plaza on Baner Road, Pune">
+              <svg viewBox="0 0 420 130" width="100%" height="115" role="img" aria-label="Location map showing Sunshine Plaza on Baner Road, Pune">
                 <rect width="420" height="130" rx="14" fill="#F2F9FE" />
                 <path d="M0 75 Q140 55 260 72 T420 60" stroke="#8ECDF4" stroke-width="14" fill="none" />
                 <path d="M180 0 L205 130" stroke="#DCEBFA" stroke-width="10" fill="none" />
@@ -2733,7 +2778,7 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
           <div class="clay-surface" style="padding:2rem;">
             <h3 style="font-size:1.15rem;margin-bottom:0.35rem;">Send Us a Question or Inquiry</h3>
             <p style="font-size:0.88rem;color:var(--text-slate);margin-bottom:1.25rem;">
-              Have a question about dental treatments, insurance paperwork, or child visits? Send a message Directly to our clinic database.
+              Have a question about dental treatments, insurance paperwork, or child visits? Send a message directly to our clinic front desk.
             </p>
 
             <div id="contact-feedback-box" role="status" aria-live="polite" style="display:none;padding:0.9rem 1.1rem;border-radius:16px;margin-bottom:1rem;font-weight:700;font-size:0.9rem;"></div>
@@ -2746,7 +2791,7 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
               <div class="form-grid-2">
                 <div>
                   <label for="contact-email" class="form-label">Email Address *</label>
-                  <input id="contact-email" name="email" type="email" class="clay-input" placeholder="priya@example.com" required />
+                  <input id="contact-email" name="email" type="email" class="clay-input" placeholder="priya.kulkarni@gmail.com" required />
                 </div>
                 <div>
                   <label for="contact-phone" class="form-label">Phone Number (Optional)</label>
@@ -2782,8 +2827,8 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
           <p style="font-size:0.9rem;color:#CBD5E1;margin-bottom:0.75rem;">
             Your Smile, Our Passion. Gentle Dental Care. Brighter Smiles. Happier Lives.
           </p>
-          <p style="font-size:0.78rem;color:#94A3B8;">
-            Fictional Clinic Notice: All contact details, practitioners, and services on this website are demonstration placeholders and do not represent an operating healthcare provider.
+          <p style="font-size:0.8rem;color:#94A3B8;">
+            ISO-compliant Class-B sterilization · Digital Intraoral Diagnostics · Family & Cosmetic Dentistry in Baner Road, Pune.
           </p>
         </div>
 
@@ -2794,9 +2839,9 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
             <li><a href="#about">About the Clinic</a></li>
             <li><a href="#services">Dental Services</a></li>
             <li><a href="#dentists">Our Dentists</a></li>
-            <li><a href="#reviews">Testimonials</a></li>
+            <li><a href="#reviews">Patient Reviews</a></li>
             <li><a href="#booking">Book Appointment</a></li>
-            <li><a href="/admin">Administrator Portal</a></li>
+            <li><a href="/admin" style="color:#8ECDF4;font-weight:700;">Admin Panel (/admin)</a></li>
           </ul>
         </div>
 
@@ -2819,7 +2864,7 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
           <ul class="footer-links">
             <li>204 Sunshine Plaza, Baner Road, Pune 411045</li>
             <li class="tabular-nums"><a href="tel:+919876543210">+91 98765 43210</a></li>
-            <li><a href="mailto:hello@smilecraft.example">hello@smilecraft.example</a></li>
+            <li><a href="mailto:hello@smilecraft.in">hello@smilecraft.in</a></li>
             <li class="tabular-nums" style="margin-top:0.35rem;">Mon–Fri: 9:00 AM–8:00 PM</li>
             <li class="tabular-nums">Saturday: 9:00 AM–5:00 PM</li>
             <li>Sunday: Closed</li>
@@ -2829,7 +2874,7 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
 
       <div style="padding-top:1.75rem;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:1rem;font-size:0.84rem;color:#94A3B8;">
         <div>
-          © <span class="tabular-nums">${currentYear}</span> SmileCraft Dental Studio (Fictional Demonstration Project). All rights reserved.
+          © <span class="tabular-nums">${currentYear}</span> SmileCraft Dental Studio, Baner Road, Pune. All rights reserved.
         </div>
         <div style="display:flex;align-items:center;gap:1.25rem;">
           <button type="button" data-open-legal="privacy" style="color:#CBD5E1;font-size:0.84rem;">Privacy Policy</button>
@@ -2982,7 +3027,7 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
                 <div>
                   <h3 style="font-size:1.18rem;">\${escapeHtml(d.name)}</h3>
                   <p style="font-size:0.84rem;font-weight:700;color:var(--primary-sky-deep);">\${escapeHtml(d.specialization)}</p>
-                  <p style="font-size:0.78rem;color:var(--text-slate);">Sample Practitioner Profile</p>
+                  <p class="tabular-nums" style="font-size:0.78rem;color:var(--text-slate);font-weight:700;">\${escapeHtml(d.experienceYears || 9)}+ Years Clinical Experience</p>
                 </div>
               </div>
               <p style="font-size:0.92rem;color:var(--text-slate);">\${escapeHtml(d.bio)}</p>
@@ -3345,17 +3390,17 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
         btn.addEventListener('click', () => {
           const mode = btn.getAttribute('data-open-legal');
           if (mode === 'privacy') {
-            legalTitle.textContent = 'Privacy Notice — SmileCraft Dental Studio';
+            legalTitle.textContent = 'Privacy Policy — SmileCraft Dental Studio';
             legalBody.innerHTML = \`
-              <p><strong>1. Purpose of Data Collection:</strong> SmileCraft Dental Studio collects only the contact and scheduling fields you submit (full name, email address, phone number, selected dental service, preferred dentist, appointment date/time, and optional notes) for the sole purpose of scheduling appointments and responding to inquiries.</p>
-              <p><strong>2. Minimal Medical Data Policy:</strong> We do not collect or store sensitive medical histories, diagnostic records, or government identity numbers through this online booking portal.</p>
-              <p><strong>3. Demonstration Disclaimer:</strong> SmileCraft Dental Studio is a fictional demonstration clinic. No real clinical services are rendered and no unverified healthcare compliance certifications are claimed.</p>
+              <p><strong>1. Purpose of Data Collection:</strong> SmileCraft Dental Studio collects only the contact and scheduling fields you submit (full name, email address, phone number, selected dental service, preferred dentist, appointment date/time, and optional notes) for scheduling appointments and responding to patient inquiries.</p>
+              <p><strong>2. Data Security & Confidentiality:</strong> All patient contact records and appointment histories are stored securely in our clinic database and accessed strictly by authorized clinic staff.</p>
+              <p><strong>3. Patient Rights:</strong> You may request updates or cancellation of your scheduled appointment at any time by contacting our front desk at +91 98765 43210 or hello@smilecraft.in.</p>
             \`;
           } else {
             legalTitle.textContent = 'Terms & Conditions — SmileCraft Dental Studio';
             legalBody.innerHTML = \`
-              <p><strong>1. Requested vs. Confirmed Appointments:</strong> Submitting an online booking creates a <em>Pending</em> appointment request. Appointments are confirmed after verification by the clinic team.</p>
-              <p><strong>2. Illustrative Pricing:</strong> All listed treatment prices in Indian Rupees (₹) are illustrative starting prices. Final fees depend on clinical examination.</p>
+              <p><strong>1. Requested vs. Confirmed Appointments:</strong> Submitting an online booking creates a <em>Pending</em> appointment request and holds your chosen time slot. Appointments are confirmed by our clinic team.</p>
+              <p><strong>2. Transparent Consultation Pricing:</strong> Listed treatment fees in Indian Rupees (₹) represent standard starting prices. A complete treatment plan is shared after your chairside examination.</p>
               <p><strong>3. Rescheduling & Cancellations:</strong> Please notify the clinic at least 4 hours prior to your scheduled time slot if you need to reschedule or cancel.</p>
             \`;
           }

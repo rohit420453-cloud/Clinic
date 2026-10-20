@@ -372,6 +372,15 @@ export function createAdminModule({
           .toArray(),
       ]);
 
+      const allActiveApts = await db
+        .collection('appointments')
+        .find({ status: { $in: ['Confirmed', 'Completed'] } })
+        .toArray();
+      const estimatedRevenue = allActiveApts.reduce(
+        (sum, item) => sum + (Number(item.servicePrice) || 499),
+        0
+      );
+
       return res.json({
         success: true,
         message: 'Dashboard metrics loaded.',
@@ -387,10 +396,58 @@ export function createAdminModule({
             todayAppointments,
             upcomingAppointments,
             newInquiries,
+            estimatedRevenue,
           },
           recentPending,
           todaySchedule,
         },
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  router.post('/api/admin/change-password', requireAdminAuth, async (req, res, next) => {
+    try {
+      const currentPassword = typeof req.body?.currentPassword === 'string' ? req.body.currentPassword : '';
+      const newPassword = typeof req.body?.newPassword === 'string' ? req.body.newPassword.trim() : '';
+      const name = sanitizeText(req.body?.name, 100);
+
+      if (!currentPassword || !newPassword || newPassword.length < 6) {
+        return res.status(400).json({
+          success: false,
+          error: {
+            code: 'INVALID_PASSWORD_INPUT',
+            message: 'Please provide your current password and a new password of at least 6 characters.',
+          },
+        });
+      }
+
+      const db = await getDb();
+      const adminUser = await db.collection('admins').findOne({ email: req.admin.email });
+      if (!adminUser || !verifyPassword(currentPassword, adminUser.passwordHash)) {
+        return res.status(401).json({
+          success: false,
+          error: {
+            code: 'INCORRECT_CURRENT_PASSWORD',
+            message: 'Current administrator password is incorrect.',
+          },
+        });
+      }
+
+      const updates = {
+        passwordHash: hashPassword(newPassword),
+        mustChangePassword: false,
+        updatedAt: new Date().toISOString(),
+      };
+      if (name) updates.name = name;
+
+      await db.collection('admins').updateOne({ email: req.admin.email }, { $set: updates });
+
+      return res.json({
+        success: true,
+        message: 'Administrator password and profile updated successfully.',
+        data: { email: req.admin.email, name: name || adminUser.name },
       });
     } catch (err) {
       next(err);
@@ -553,6 +610,132 @@ export function createAdminModule({
         success: true,
         message: 'Appointment details loaded.',
         data: apt,
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  router.post('/api/admin/appointments', requireAdminAuth, async (req, res, next) => {
+    try {
+      const patientName = sanitizeText(req.body?.patientName, 100);
+      const email = sanitizeText(req.body?.email, 120).toLowerCase();
+      const phone = sanitizeText(req.body?.phone, 25);
+      const serviceId = sanitizeText(req.body?.serviceId, 60);
+      const dentistId = sanitizeText(req.body?.dentistId || 'dentist-aanya', 60);
+      const appointmentDate = sanitizeText(req.body?.appointmentDate, 20);
+      const timeSlot = sanitizeText(req.body?.timeSlot, 20);
+      const status = ['Pending', 'Confirmed', 'Completed'].includes(req.body?.status)
+        ? req.body.status
+        : 'Confirmed';
+      const notes = sanitizeText(req.body?.notes, 500);
+
+      if (!patientName || !phone || !serviceId || !appointmentDate || !timeSlot) {
+        return res.status(400).json({
+          success: false,
+          error: {
+            code: 'MISSING_FIELDS',
+            message: 'Patient name, phone, service, date, and time slot are required.',
+          },
+        });
+      }
+
+      const db = await getDb();
+      const [serviceDoc, dentistDoc] = await Promise.all([
+        db.collection('services').findOne({ serviceId }),
+        db.collection('dentists').findOne({ dentistId }),
+      ]);
+
+      if (!serviceDoc) {
+        return res.status(400).json({
+          success: false,
+          error: { code: 'INVALID_SERVICE', message: 'Selected service does not exist.' },
+        });
+      }
+      if (!dentistDoc) {
+        return res.status(400).json({
+          success: false,
+          error: { code: 'INVALID_DENTIST', message: 'Selected dentist does not exist.' },
+        });
+      }
+
+      const year = new Date().getFullYear();
+      const suffix = crypto.randomBytes(2).toString('hex').toUpperCase();
+      const appointmentId = `SC-${year}-${suffix}`;
+
+      if (['Pending', 'Confirmed'].includes(status)) {
+        const reservation = await reserveAppointmentSlot(db, {
+          dentistKey: dentistDoc.dentistId,
+          appointmentDate,
+          timeSlot,
+          appointmentId,
+        });
+        if (!reservation.reserved) {
+          return res.status(409).json({
+            success: false,
+            error: {
+              code: 'SLOT_ALREADY_BOOKED',
+              message: `${timeSlot} on ${appointmentDate} is already reserved for ${dentistDoc.name}.`,
+            },
+          });
+        }
+      }
+
+      const nowIso = new Date().toISOString();
+      const newApt = {
+        appointmentId,
+        patientName,
+        email: email || 'walkin@smilecraft.in',
+        phone,
+        serviceId: serviceDoc.serviceId,
+        serviceName: serviceDoc.name,
+        servicePrice: serviceDoc.price,
+        dentistId: dentistDoc.dentistId,
+        dentistKey: dentistDoc.dentistId,
+        dentistName: dentistDoc.name,
+        appointmentDate,
+        timeSlot,
+        status,
+        notes: notes || 'Booked at clinic reception desk.',
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      };
+
+      await db.collection('appointments').insertOne(newApt);
+      return res.status(201).json({
+        success: true,
+        message: `Appointment ${appointmentId} created (${status}).`,
+        data: newApt,
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  router.delete('/api/admin/appointments/:appointmentId', requireAdminAuth, async (req, res, next) => {
+    try {
+      const appointmentId = sanitizeText(req.params.appointmentId, 40);
+      const db = await getDb();
+      const existing = await db.collection('appointments').findOne({ appointmentId });
+      if (!existing) {
+        return res.status(404).json({
+          success: false,
+          error: { code: 'NOT_FOUND', message: 'Appointment not found.' },
+        });
+      }
+
+      await releaseAppointmentSlot(db, {
+        appointmentId,
+        dentistKey: existing.dentistKey || existing.dentistId,
+        appointmentDate: existing.appointmentDate,
+        timeSlot: existing.timeSlot,
+      });
+      await db.collection('appointments').deleteOne({ appointmentId });
+
+      return res.json({
+        success: true,
+        message: `Appointment ${appointmentId} deleted and slot released.`,
+        data: { appointmentId },
       });
     } catch (err) {
       next(err);
@@ -2031,7 +2214,7 @@ export function renderAdminHtml() {
               <form id="admin-login-form" novalidate>
                 <div style="margin-bottom:1rem;">
                   <label for="admin-email" style="display:block;font-weight:700;font-size:0.88rem;margin-bottom:0.35rem;">Administrator Email</label>
-                  <input id="admin-email" name="email" type="email" class="clay-input" placeholder="admin@smilecraft.example" required autocomplete="username" />
+                  <input id="admin-email" name="email" type="email" class="clay-input" placeholder="admin@smilecraft.in" required autocomplete="username" />
                 </div>
 
                 <div style="margin-bottom:1.25rem;">
@@ -2043,13 +2226,13 @@ export function renderAdminHtml() {
                 </div>
 
                 <button type="submit" id="login-submit-btn" class="clay-btn-primary" style="width:100%;padding:0.8rem;">
-                  Sign In to Dashboard
+                  Sign In to Clinic Portal
                 </button>
               </form>
 
               <div style="margin-top:1.25rem;padding-top:1rem;border-top:1px solid var(--border-soft);display:flex;align-items:center;justify-content:space-between;gap:0.5rem;flex-wrap:wrap;">
                 <button type="button" id="fill-demo-admin-btn" class="clay-btn-secondary" style="font-size:0.8rem;padding:0.45rem 0.85rem;">
-                  Fill Demo Credentials
+                  Quick Fill Reception Login
                 </button>
                 <a href="/" style="font-size:0.85rem;font-weight:700;color:var(--primary-sky-deep);text-decoration:none;">← Return to Public Clinic Site</a>
               </div>
@@ -2096,14 +2279,14 @@ export function renderAdminHtml() {
               <span style="font-size:0.8rem;color:var(--text-slate);">Future dates</span>
             </article>
             <article class="stat-card tint-peach">
-              <span class="stat-label">Cancelled / Rejected</span>
-              <span class="stat-value tabular-nums">\${s.cancelledAppointments}</span>
-              <span style="font-size:0.8rem;color:var(--text-slate);">Slots released</span>
+              <span class="stat-label">Estimated Treatment Value</span>
+              <span class="stat-value tabular-nums">₹\${Number(s.estimatedRevenue || 0).toLocaleString('en-IN')}</span>
+              <span style="font-size:0.8rem;color:var(--text-slate);">Confirmed & completed visits</span>
             </article>
             <article class="stat-card tint-sky">
               <span class="stat-label">New Patient Inquiries</span>
               <span class="stat-value tabular-nums">\${s.newInquiries}</span>
-              <span style="font-size:0.8rem;color:var(--primary-sky-deep);font-weight:600;">Contact messages</span>
+              <span style="font-size:0.8rem;color:var(--primary-sky-deep);font-weight:600;">Contact desk messages</span>
             </article>
           </div>
 
@@ -2196,9 +2379,10 @@ export function renderAdminHtml() {
             <div style="padding:1.25rem 1.5rem;border-bottom:1px solid var(--border-soft);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:1rem;">
               <div>
                 <h2 style="font-size:1.15rem;">Appointment Management</h2>
-                <p style="font-size:0.85rem;color:var(--text-slate);">Search, filter, confirm, reschedule, or export patient bookings.</p>
+                <p style="font-size:0.85rem;color:var(--text-slate);">Search, filter, confirm, reschedule, add walk-in patients, or export bookings.</p>
               </div>
-              <div style="display:flex;gap:0.6rem;align-items:center;">
+              <div style="display:flex;gap:0.6rem;align-items:center;flex-wrap:wrap;">
+                <button type="button" id="new-walkin-btn" class="clay-btn-primary">+ Walk-In / Phone Booking</button>
                 <button type="button" id="export-csv-btn" class="clay-btn-secondary">Download CSV</button>
               </div>
             </div>
@@ -2281,7 +2465,7 @@ export function renderAdminHtml() {
                           \${escapeHtml(String(apt.createdAt || '').slice(0, 10))}
                         </td>
                         <td>
-                          <div style="display:flex;gap:0.4rem;flex-wrap:wrap;">
+                          <div style="display:flex;gap:0.4rem;flex-wrap:wrap;align-items:center;">
                             \${apt.status === 'Pending' ? \`
                               <button type="button" class="clay-btn-primary" data-quick-status="Confirmed" data-apt-id="\${escapeHtml(apt.appointmentId)}" style="padding:0.35rem 0.65rem;font-size:0.76rem;">Confirm</button>
                             \` : ''}
@@ -2289,6 +2473,7 @@ export function renderAdminHtml() {
                               <button type="button" class="clay-btn-secondary" data-quick-status="Completed" data-apt-id="\${escapeHtml(apt.appointmentId)}" style="padding:0.35rem 0.65rem;font-size:0.76rem;">Complete</button>
                             \` : ''}
                             <button type="button" class="clay-btn-secondary" data-open-apt="\${escapeHtml(apt.appointmentId)}" style="padding:0.35rem 0.65rem;font-size:0.76rem;">Manage</button>
+                            <a href="https://wa.me/\${encodeURIComponent(String(apt.phone || '').replace(/[^0-9]/g, ''))}?text=\${encodeURIComponent('Hello ' + apt.patientName + ', your appointment (' + apt.appointmentId + ') for ' + apt.serviceName + ' at SmileCraft Dental Studio on ' + apt.appointmentDate + ' at ' + apt.timeSlot + ' is ' + apt.status + '.')}" target="_blank" rel="noopener noreferrer" class="clay-btn-secondary" style="padding:0.35rem 0.6rem;font-size:0.74rem;text-decoration:none;color:#136346;">WhatsApp</a>
                           </div>
                         </td>
                       </tr>
@@ -2453,7 +2638,7 @@ export function renderAdminHtml() {
             <div style="padding:1.25rem 1.5rem;border-bottom:1px solid var(--border-soft);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:1rem;">
               <div>
                 <h2 style="font-size:1.15rem;">Dental Services Catalog</h2>
-                <p style="font-size:0.85rem;color:var(--text-slate);">Manage canonical services, illustrative starting prices (INR), and active booking status.</p>
+                <p style="font-size:0.85rem;color:var(--text-slate);">Manage dental treatments, consultation & procedure fees (INR), and active booking status.</p>
               </div>
               <button type="button" id="new-service-btn" class="clay-btn-primary">+ Add New Service</button>
             </div>
@@ -2508,7 +2693,7 @@ export function renderAdminHtml() {
             <div style="padding:1.25rem 1.5rem;border-bottom:1px solid var(--border-soft);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:1rem;">
               <div>
                 <h2 style="font-size:1.15rem;">Practitioner Profiles</h2>
-                <p style="font-size:0.85rem;color:var(--text-slate);">Manage fictional demonstration dentist profiles and clinic availability.</p>
+                <p style="font-size:0.85rem;color:var(--text-slate);">Manage clinic dental practitioners, clinical specializations, and availability status.</p>
               </div>
               <button type="button" id="new-dentist-btn" class="clay-btn-primary">+ Add Dentist Profile</button>
             </div>
@@ -2806,9 +2991,86 @@ export function renderAdminHtml() {
                     <textarea id="modal-apt-notes" class="clay-input" rows="2" placeholder="Optional scheduling notes...">\${escapeHtml(apt.adminNotes || '')}</textarea>
                   </div>
 
+                  <div style="display:flex;justify-content:space-between;align-items:center;gap:0.65rem;flex-wrap:wrap;">
+                    <button type="button" id="delete-apt-btn" data-delete-apt="\${escapeHtml(apt.appointmentId)}" class="clay-btn-danger">Delete Booking</button>
+                    <div style="display:flex;gap:0.65rem;">
+                      <button type="button" id="cancel-modal-btn" class="clay-btn-secondary">Cancel</button>
+                      <button type="submit" class="clay-btn-primary">Save Appointment Changes</button>
+                    </div>
+                  </div>
+                </form>
+              </div>
+            </div>
+          \`;
+        }
+
+        if (m.type === 'walkin') {
+          const defaultDate = state.dashboard?.clinicDate || new Date().toISOString().slice(0, 10);
+          return \`
+            <div class="modal-backdrop" id="modal-backdrop">
+              <div class="clay-card modal-dialog" role="dialog" aria-modal="true" aria-labelledby="modal-walkin-title">
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:1rem;">
+                  <h2 id="modal-walkin-title" style="font-size:1.15rem;">New Walk-In / Phone Appointment</h2>
+                  <button type="button" id="close-modal-btn" class="clay-btn-secondary" style="padding:0.35rem 0.7rem;">Close</button>
+                </div>
+                <form id="walkin-apt-form">
+                  <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.85rem;margin-bottom:0.85rem;">
+                    <div>
+                      <label for="wi-name" style="display:block;font-size:0.8rem;font-weight:700;margin-bottom:0.25rem;">Patient Full Name *</label>
+                      <input id="wi-name" type="text" class="clay-input" placeholder="e.g. Vikram Deshmukh" required />
+                    </div>
+                    <div>
+                      <label for="wi-phone" style="display:block;font-size:0.8rem;font-weight:700;margin-bottom:0.25rem;">Phone Number *</label>
+                      <input id="wi-phone" type="tel" class="clay-input tabular-nums" placeholder="+91 98220 12345" required />
+                    </div>
+                    <div>
+                      <label for="wi-email" style="display:block;font-size:0.8rem;font-weight:700;margin-bottom:0.25rem;">Email Address (Optional)</label>
+                      <input id="wi-email" type="email" class="clay-input" placeholder="patient@gmail.com" />
+                    </div>
+                    <div>
+                      <label for="wi-status" style="display:block;font-size:0.8rem;font-weight:700;margin-bottom:0.25rem;">Initial Status *</label>
+                      <select id="wi-status" class="clay-input">
+                        <option value="Confirmed" selected>Confirmed (Hold Slot)</option>
+                        <option value="Pending">Pending</option>
+                        <option value="Completed">Completed (Walk-In Done)</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label for="wi-service" style="display:block;font-size:0.8rem;font-weight:700;margin-bottom:0.25rem;">Dental Service *</label>
+                      <select id="wi-service" class="clay-input" required>
+                        \${state.services.filter(s => s.active).map(s =>
+                          \`<option value="\${escapeHtml(s.serviceId)}">\${escapeHtml(s.name)} (₹\${escapeHtml(s.price)})</option>\`
+                        ).join('')}
+                      </select>
+                    </div>
+                    <div>
+                      <label for="wi-dentist" style="display:block;font-size:0.8rem;font-weight:700;margin-bottom:0.25rem;">Assigned Dentist *</label>
+                      <select id="wi-dentist" class="clay-input" required>
+                        \${state.dentists.filter(d => d.active).map(d =>
+                          \`<option value="\${escapeHtml(d.dentistId)}">\${escapeHtml(d.name)}</option>\`
+                        ).join('')}
+                      </select>
+                    </div>
+                    <div>
+                      <label for="wi-date" style="display:block;font-size:0.8rem;font-weight:700;margin-bottom:0.25rem;">Appointment Date *</label>
+                      <input id="wi-date" type="date" class="clay-input tabular-nums" value="\${escapeHtml(defaultDate)}" required />
+                    </div>
+                    <div>
+                      <label for="wi-slot" style="display:block;font-size:0.8rem;font-weight:700;margin-bottom:0.25rem;">Time Slot *</label>
+                      <select id="wi-slot" class="clay-input tabular-nums">
+                        \${['09:00 AM', '10:00 AM', '11:00 AM', '12:00 PM', '02:00 PM', '03:00 PM', '04:00 PM', '05:00 PM', '06:00 PM', '07:00 PM'].map(slot =>
+                          \`<option value="\${slot}">\${slot}</option>\`
+                        ).join('')}
+                      </select>
+                    </div>
+                  </div>
+                  <div style="margin-bottom:1.25rem;">
+                    <label for="wi-notes" style="display:block;font-size:0.8rem;font-weight:700;margin-bottom:0.25rem;">Clinical / Reception Notes</label>
+                    <textarea id="wi-notes" class="clay-input" rows="2" placeholder="Walk-in consultation or phone booking notes..."></textarea>
+                  </div>
                   <div style="display:flex;justify-content:flex-end;gap:0.65rem;">
                     <button type="button" id="cancel-modal-btn" class="clay-btn-secondary">Cancel</button>
-                    <button type="submit" class="clay-btn-primary">Save Appointment Changes</button>
+                    <button type="submit" class="clay-btn-primary">Create Appointment</button>
                   </div>
                 </form>
               </div>
@@ -2940,6 +3202,53 @@ export function renderAdminHtml() {
         return '';
       }
 
+      function renderSettingsTab() {
+        return \`
+          <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(360px, 1fr));gap:1.5rem;">
+            <section class="clay-card" style="padding:1.75rem;">
+              <h2 style="font-size:1.15rem;margin-bottom:0.35rem;">Administrator Profile & Password Security</h2>
+              <p style="font-size:0.85rem;color:var(--text-slate);margin-bottom:1.25rem;">
+                Update your clinic administrator display name and rotate your login password.
+              </p>
+              <form id="admin-password-form">
+                <div style="margin-bottom:0.9rem;">
+                  <label for="sec-admin-name" style="display:block;font-size:0.82rem;font-weight:700;margin-bottom:0.25rem;">Administrator Name</label>
+                  <input id="sec-admin-name" type="text" class="clay-input" value="\${escapeHtml(state.admin?.name || 'Dr. Aanya Mehta · Clinic Admin')}" required />
+                </div>
+                <div style="margin-bottom:0.9rem;">
+                  <label for="sec-current-pass" style="display:block;font-size:0.82rem;font-weight:700;margin-bottom:0.25rem;">Current Password *</label>
+                  <input id="sec-current-pass" type="password" class="clay-input" placeholder="Enter current password" required />
+                </div>
+                <div style="margin-bottom:1.25rem;">
+                  <label for="sec-new-pass" style="display:block;font-size:0.82rem;font-weight:700;margin-bottom:0.25rem;">New Password (min 6 characters) *</label>
+                  <input id="sec-new-pass" type="password" class="clay-input" placeholder="Enter new strong password" required />
+                </div>
+                <button type="submit" class="clay-btn-primary">Update Password & Profile</button>
+              </form>
+            </section>
+
+            <section class="clay-card" style="padding:1.75rem;">
+              <h2 style="font-size:1.15rem;margin-bottom:0.35rem;">Clinic Information & Operations Summary</h2>
+              <p style="font-size:0.85rem;color:var(--text-slate);margin-bottom:1.1rem;">
+                Active clinic configuration for SmileCraft Dental Studio.
+              </p>
+              <div style="display:flex;flex-direction:column;gap:0.75rem;font-size:0.9rem;">
+                <div style="padding:0.85rem 1rem;border-radius:16px;background:var(--bg-surface);">
+                  <strong>Clinic Name:</strong> SmileCraft Dental Studio<br />
+                  <strong>Location:</strong> 204 Sunshine Plaza, Baner Road, Pune 411045
+                </div>
+                <div style="padding:0.85rem 1rem;border-radius:16px;background:var(--bg-surface);">
+                  <strong>Reception Desk:</strong> <span class="tabular-nums">+91 98765 43210</span> · <span>hello@smilecraft.in</span>
+                </div>
+                <div style="padding:0.85rem 1rem;border-radius:16px;background:var(--bg-surface);">
+                  <strong>Signed-In Account:</strong> <span class="tabular-nums">\${escapeHtml(state.admin?.email || 'admin@smilecraft.in')}</span>
+                </div>
+              </div>
+            </section>
+          </div>
+        \`;
+      }
+
       function renderAuthenticatedShell() {
         const pendingCount = state.dashboard?.stats?.pendingAppointments || 0;
         const navItems = [
@@ -2951,6 +3260,7 @@ export function renderAdminHtml() {
           { id: 'dentists', label: 'Our Dentists' },
           { id: 'availability', label: 'Hours & Blocks' },
           { id: 'inquiries', label: 'Patient Inquiries', count: state.dashboard?.stats?.newInquiries || 0 },
+          { id: 'settings', label: 'Settings & Security' },
         ];
 
         let activeContent = '';
@@ -2962,6 +3272,7 @@ export function renderAdminHtml() {
         else if (state.activeTab === 'dentists') activeContent = renderDentistsTab();
         else if (state.activeTab === 'availability') activeContent = renderAvailabilityTab();
         else if (state.activeTab === 'inquiries') activeContent = renderInquiriesTab();
+        else if (state.activeTab === 'settings') activeContent = renderSettingsTab();
 
         return \`
           <div class="admin-shell">
@@ -3001,9 +3312,10 @@ export function renderAdminHtml() {
                     Admin Portal / \${escapeHtml(navItems.find(n => n.id === state.activeTab)?.label || 'Overview')}
                   </span>
                 </div>
-                <div style="display:flex;align-items:center;gap:1rem;">
+                <div style="display:flex;align-items:center;gap:0.85rem;">
+                  <button type="button" id="topbar-walkin-btn" class="clay-btn-primary" style="padding:0.45rem 0.9rem;font-size:0.8rem;">+ Walk-In Booking</button>
                   <span style="font-size:0.85rem;color:var(--text-slate);">
-                    Signed in as <strong>\${escapeHtml(state.admin?.email || 'admin@smilecraft.example')}</strong>
+                    Signed in as <strong>\${escapeHtml(state.admin?.email || 'admin@smilecraft.in')}</strong>
                   </span>
                 </div>
               </header>
@@ -3045,7 +3357,7 @@ export function renderAdminHtml() {
           const fillDemoBtn = document.getElementById('fill-demo-admin-btn');
           if (fillDemoBtn) {
             fillDemoBtn.addEventListener('click', () => {
-              document.getElementById('admin-email').value = 'admin@smilecraft.example';
+              document.getElementById('admin-email').value = 'admin@smilecraft.in';
               document.getElementById('admin-password').value = 'ChangeMe@12345';
             });
           }
@@ -3487,6 +3799,96 @@ export function renderAdminHtml() {
               const dentRes = await apiFetch('/api/admin/dentists');
               state.dentists = dentRes.data;
               showToast('Dentist profile saved.');
+              render();
+            } catch (err) {
+              showToast(err.message, true);
+            }
+          });
+        }
+
+        // Walk-In / Phone Booking modal triggers & submission
+        const newWalkinBtn = document.getElementById('new-walkin-btn');
+        const topbarWalkinBtn = document.getElementById('topbar-walkin-btn');
+        [newWalkinBtn, topbarWalkinBtn].forEach((btn) => {
+          if (btn) {
+            btn.addEventListener('click', () => {
+              state.modal = { type: 'walkin' };
+              render();
+            });
+          }
+        });
+
+        const walkinAptForm = document.getElementById('walkin-apt-form');
+        if (walkinAptForm) {
+          walkinAptForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            try {
+              const res = await apiFetch('/api/admin/appointments', {
+                method: 'POST',
+                body: JSON.stringify({
+                  patientName: document.getElementById('wi-name').value.trim(),
+                  phone: document.getElementById('wi-phone').value.trim(),
+                  email: document.getElementById('wi-email').value.trim(),
+                  status: document.getElementById('wi-status').value,
+                  serviceId: document.getElementById('wi-service').value,
+                  dentistId: document.getElementById('wi-dentist').value,
+                  appointmentDate: document.getElementById('wi-date').value,
+                  timeSlot: document.getElementById('wi-slot').value,
+                  notes: document.getElementById('wi-notes').value.trim(),
+                }),
+              });
+              state.modal = null;
+              await loadInitialAdminData();
+              if (state.activeTab === 'calendar') await loadCalendar();
+              showToast(res.message || 'Walk-in appointment created.');
+              render();
+            } catch (err) {
+              showToast(err.message, true);
+            }
+          });
+        }
+
+        // Delete appointment button inside Manage Modal
+        const deleteAptBtn = document.getElementById('delete-apt-btn');
+        if (deleteAptBtn) {
+          deleteAptBtn.addEventListener('click', async () => {
+            const aptId = deleteAptBtn.getAttribute('data-delete-apt');
+            if (!aptId) return;
+            try {
+              await apiFetch('/api/admin/appointments/' + encodeURIComponent(aptId), {
+                method: 'DELETE',
+              });
+              state.modal = null;
+              await loadInitialAdminData();
+              if (state.activeTab === 'calendar') await loadCalendar();
+              showToast('Appointment ' + aptId + ' deleted.');
+              render();
+            } catch (err) {
+              showToast(err.message, true);
+            }
+          });
+        }
+
+        // Admin Password & Profile Settings Form
+        const adminPassForm = document.getElementById('admin-password-form');
+        if (adminPassForm) {
+          adminPassForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            try {
+              const res = await apiFetch('/api/admin/change-password', {
+                method: 'POST',
+                body: JSON.stringify({
+                  name: document.getElementById('sec-admin-name').value.trim(),
+                  currentPassword: document.getElementById('sec-current-pass').value,
+                  newPassword: document.getElementById('sec-new-pass').value,
+                }),
+              });
+              if (res.data?.name && state.admin) {
+                state.admin.name = res.data.name;
+              }
+              document.getElementById('sec-current-pass').value = '';
+              document.getElementById('sec-new-pass').value = '';
+              showToast(res.message || 'Password updated.');
               render();
             } catch (err) {
               showToast(err.message, true);
