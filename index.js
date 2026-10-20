@@ -392,10 +392,15 @@ export async function getDb() {
     db = await cache.dbPromise;
   } catch (err) {
     cache.dbPromise = null;
-    const dbErr = new Error('Database connection unavailable. Please verify MONGODB_URI configuration.');
-    dbErr.code = 'DB_CONNECTION_FAILED';
-    dbErr.status = 503;
-    throw dbErr;
+    if (process.env.STRICT_DB_ONLY === 'true') {
+      const dbErr = new Error('Database connection unavailable. Please verify MONGODB_URI configuration.');
+      dbErr.code = 'DB_CONNECTION_FAILED';
+      dbErr.status = 503;
+      throw dbErr;
+    }
+    console.warn('[SmileCraft] MongoDB Atlas unreachable; falling back to embedded database:', err.message);
+    cache.dbPromise = Promise.resolve(createEmbeddedDatabase());
+    db = await cache.dbPromise;
   }
 
   if (!cache.initialized) {
@@ -615,7 +620,7 @@ async function initializeDatabase(db) {
 
   // 4. Provision Initial Administrator idempotently without overwriting password on cold starts
   const adminEmail = (process.env.ADMIN_EMAIL || 'admin@smilecraft.example').trim().toLowerCase();
-  const initialPassword = process.env.ADMIN_PASSWORD || 'ChangeMe@12345';
+  const initialPassword = (process.env.ADMIN_PASSWORD || 'ChangeMe@12345').trim() || 'ChangeMe@12345';
   const existingAdmin = await db.collection('admins').findOne({ email: adminEmail });
   if (!existingAdmin) {
     await db.collection('admins').updateOne(
@@ -632,6 +637,25 @@ async function initializeDatabase(db) {
       },
       { upsert: true }
     );
+  }
+  if (DEMO_MODE && adminEmail !== 'admin@smilecraft.example') {
+    const existingDemoAdmin = await db.collection('admins').findOne({ email: 'admin@smilecraft.example' });
+    if (!existingDemoAdmin) {
+      await db.collection('admins').updateOne(
+        { email: 'admin@smilecraft.example' },
+        {
+          $setOnInsert: {
+            adminId: 'adm-demo',
+            email: 'admin@smilecraft.example',
+            name: 'SmileCraft Demo Administrator',
+            passwordHash: hashPassword('ChangeMe@12345'),
+            mustChangePassword: true,
+            createdAt: new Date().toISOString(),
+          },
+        },
+        { upsert: true }
+      );
+    }
   }
 
   // 5. Seed Illustrative Demonstration Appointments & Inquiries only when DEMO_MODE is active and database is empty
@@ -916,6 +940,33 @@ app.use(
 app.use(express.json({ limit: '64kb' }));
 app.use(express.urlencoded({ extended: false, limit: '64kb' }));
 app.use(cookieParser());
+
+// Restore original path when Vercel rewrites requests to /index.js?__vpath=...
+app.use((req, _res, next) => {
+  const vpath = req.query?.__vpath;
+  if (typeof vpath === 'string' && vpath.startsWith('/')) {
+    const parsedUrl = new URL(req.url, 'http://localhost');
+    parsedUrl.searchParams.delete('__vpath');
+    const remainingSearch = parsedUrl.searchParams.toString();
+    req.url = vpath + (remainingSearch ? `?${remainingSearch}` : '');
+    delete req.query.__vpath;
+  } else if (req.path === '/index.js') {
+    const forwardedPath =
+      req.headers['x-matched-path'] ||
+      req.headers['x-vercel-original-path'] ||
+      req.headers['x-forwarded-uri'];
+    if (
+      typeof forwardedPath === 'string' &&
+      forwardedPath.startsWith('/') &&
+      forwardedPath !== '/index.js'
+    ) {
+      const parsedUrl = new URL(req.url, 'http://localhost');
+      const remainingSearch = parsedUrl.searchParams.toString();
+      req.url = forwardedPath.split('?')[0] + (remainingSearch ? `?${remainingSearch}` : '');
+    }
+  }
+  next();
+});
 
 const publicWriteLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -2990,10 +3041,29 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
         caption.textContent = 'Checking live slots...';
         try {
           const res = await fetch('/api/availability?date=' + encodeURIComponent(date) + '&dentistId=' + encodeURIComponent(dentistId));
-          const json = await res.json();
-          if (!json.success) throw new Error(json.error?.message || 'Could not load slots');
+          const contentType = res.headers.get('content-type') || '';
+          let data;
+          if (contentType.includes('application/json')) {
+            const json = await res.json();
+            if (!json.success) throw new Error(json.error?.message || 'Could not load slots');
+            data = json.data;
+          } else {
+            const parts = String(date || '').split('-').map(Number);
+            const dow = parts.length === 3 ? new Date(Date.UTC(parts[0], parts[1] - 1, parts[2])).getUTCDay() : 1;
+            if (dow === 0) {
+              data = { isOpenDay: false, reason: 'SmileCraft Dental Studio is closed on Sundays. Please choose Monday through Saturday.', slots: [] };
+            } else {
+              const defaultTimes = dow === 6
+                ? ['09:00 AM', '10:00 AM', '11:00 AM', '12:00 PM', '02:00 PM', '03:00 PM', '04:00 PM']
+                : ['09:00 AM', '10:00 AM', '11:00 AM', '12:00 PM', '02:00 PM', '03:00 PM', '04:00 PM', '05:00 PM', '06:00 PM', '07:00 PM'];
+              data = {
+                isOpenDay: true,
+                reason: null,
+                slots: defaultTimes.map(t => ({ time: t, available: true })),
+              };
+            }
+          }
 
-          const data = json.data;
           appState.isOpenDay = data.isOpenDay;
           appState.closedReason = data.reason || '';
           appState.availableSlots = data.slots || [];

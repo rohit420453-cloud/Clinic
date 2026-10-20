@@ -3,19 +3,19 @@
   "rewrites": [
     {
       "source": "/api/(.*)",
-      "destination": "/index.js"
+      "destination": "/index.js?__vpath=/api/$1"
     },
     {
       "source": "/admin",
-      "destination": "/index.js"
+      "destination": "/index.js?__vpath=/admin"
     },
     {
       "source": "/admin/(.*)",
-      "destination": "/index.js"
+      "destination": "/index.js?__vpath=/admin/$1"
     },
     {
       "source": "/(.*)",
-      "destination": "/index.js"
+      "destination": "/index.js?__vpath=/$1"
     }
   ]
 }

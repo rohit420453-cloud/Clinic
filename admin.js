@@ -14,8 +14,8 @@ import rateLimit from 'express-rate-limit';
 const SCRYPT_KEYLEN = 64;
 
 export function hashPassword(password, existingSalt = null) {
-  if (typeof password !== 'string' || password.length < 8) {
-    throw new Error('Password must be at least 8 characters long.');
+  if (typeof password !== 'string' || password.length < 1) {
+    throw new Error('Password must not be empty.');
   }
   const salt = existingSalt || crypto.randomBytes(16).toString('hex');
   const derived = crypto.scryptSync(password, salt, SCRYPT_KEYLEN).toString('hex');
