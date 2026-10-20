@@ -1,0 +1,6 @@
+{
+  "name": "SmileCraft Dental Studio — Online Booking & Clinic Management",
+  "description": "Full-stack claymorphic dental clinic website, atomic appointment booking system, and administrator dashboard powered by Node.js, Express, and MongoDB.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

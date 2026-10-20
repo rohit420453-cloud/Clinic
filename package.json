@@ -1,0 +1,26 @@
+{
+  "name": "smilecraft-dental-studio",
+  "description": "Full-stack claymorphic dental clinic website, online appointment booking system, and administrator dashboard powered by Node.js, Express, and MongoDB Atlas.",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "engines": {
+    "node": "24.x"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js",
+    "build": "node --check index.js && node --check admin.js",
+    "lint": "node --check index.js && node --check admin.js"
+  },
+  "dependencies": {
+    "cookie-parser": "1.4.7",
+    "cors": "2.8.6",
+    "dotenv": "17.2.3",
+    "express": "4.21.2",
+    "express-rate-limit": "8.7.1",
+    "helmet": "8.3.0",
+    "mongodb": "7.7.0"
+  }
+}
