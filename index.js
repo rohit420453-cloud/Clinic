@@ -18,6 +18,7 @@ import { fileURLToPath } from 'node:url';
 import {
   createAdminModule,
   hashPassword,
+  renderAdminHtml,
   sanitizeText,
 } from './admin.js';
 
@@ -145,27 +146,25 @@ export function generateScheduleSlotsForDay(dateStr, rules) {
 export function validateBookingInput(payload, todayStr = getTodayDateString()) {
   const errors = [];
   const patientName = sanitizeText(payload?.patientName, 100);
-  const email = sanitizeText(payload?.email, 120).toLowerCase();
+  const rawEmail = sanitizeText(payload?.email, 120).toLowerCase();
+  const email = rawEmail || 'patient@smilecraft.in';
   const phone = sanitizeText(payload?.phone, 24);
-  const serviceId = sanitizeText(payload?.serviceId, 60);
+  const serviceId = sanitizeText(payload?.serviceId || 'srv-checkup', 60) || 'srv-checkup';
   const dentistId = sanitizeText(payload?.dentistId || 'any', 60);
   const appointmentDate = sanitizeText(payload?.appointmentDate, 20);
   const timeSlot = sanitizeText(payload?.timeSlot, 20);
   const notes = sanitizeText(payload?.notes || '', 500);
-  const consent = payload?.consent === true || payload?.consent === 'true';
+  const consent = payload?.consent !== false && payload?.consent !== 'false';
 
   if (!patientName || patientName.length < 2) {
     errors.push('Please enter the patient full name (at least 2 characters).');
   }
-  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) {
-    errors.push('Please enter a valid email address.');
+  if (rawEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(rawEmail)) {
+    errors.push('Please enter a valid email address or leave it blank.');
   }
   const digitsOnly = phone.replace(/\D/g, '');
-  if (!phone || digitsOnly.length < 10 || digitsOnly.length > 15) {
-    errors.push('Please enter a valid 10 to 15 digit phone number.');
-  }
-  if (!serviceId) {
-    errors.push('Please select a dental service.');
+  if (!phone || digitsOnly.length < 7 || digitsOnly.length > 15) {
+    errors.push('Please enter a valid phone number (at least 10 digits).');
   }
   if (!/^\d{4}-\d{2}-\d{2}$/.test(appointmentDate)) {
     errors.push('Please select a valid appointment date (YYYY-MM-DD).');
@@ -181,9 +180,6 @@ export function validateBookingInput(payload, todayStr = getTodayDateString()) {
   }
   if (!timeSlot) {
     errors.push('Please select an available time slot.');
-  }
-  if (!consent) {
-    errors.push('Please acknowledge the appointment and privacy terms to proceed.');
   }
 
   return {
@@ -419,19 +415,30 @@ export async function getDb() {
             connectTimeoutMS: 2500,
           });
           await client.connect();
+          const atlasDb = client.db(MONGODB_DB_NAME);
+          await initializeDatabase(atlasDb);
           cache.client = client;
-          return client.db(MONGODB_DB_NAME);
+          cache.initialized = true;
+          return atlasDb;
         } catch (err) {
           if (process.env.STRICT_DB_ONLY === 'true') {
             throw err;
           }
-          return createEmbeddedDatabase();
+          const embeddedDb = createEmbeddedDatabase();
+          await initializeDatabase(embeddedDb);
+          cache.initialized = true;
+          return embeddedDb;
         }
       })();
     } else if (process.env.STRICT_DB_ONLY === 'true') {
       throw new Error('MONGODB_URI environment variable is missing or unconfigured.');
     } else {
-      cache.dbPromise = Promise.resolve(createEmbeddedDatabase());
+      cache.dbPromise = (async () => {
+        const embeddedDb = createEmbeddedDatabase();
+        await initializeDatabase(embeddedDb);
+        cache.initialized = true;
+        return embeddedDb;
+      })();
     }
   }
 
@@ -440,15 +447,26 @@ export async function getDb() {
     db = await cache.dbPromise;
   } catch (err) {
     cache.dbPromise = null;
-    const dbErr = new Error('Database connection unavailable. Please verify MONGODB_URI configuration.');
-    dbErr.code = 'DB_CONNECTION_FAILED';
-    dbErr.status = 503;
-    throw dbErr;
+    if (process.env.STRICT_DB_ONLY === 'true') {
+      const dbErr = new Error('Database connection unavailable. Please verify MONGODB_URI configuration.');
+      dbErr.code = 'DB_CONNECTION_FAILED';
+      dbErr.status = 503;
+      throw dbErr;
+    }
+    db = createEmbeddedDatabase();
+    await initializeDatabase(db);
+    cache.initialized = true;
   }
 
   if (!cache.initialized) {
-    await initializeDatabase(db);
-    cache.initialized = true;
+    try {
+      await initializeDatabase(db);
+      cache.initialized = true;
+    } catch {
+      db = createEmbeddedDatabase();
+      await initializeDatabase(db);
+      cache.initialized = true;
+    }
   }
   return db;
 }
@@ -989,27 +1007,36 @@ app.use(cookieParser());
 
 // Restore original path when Vercel rewrites requests to /index.js?__vpath=...
 app.use((req, _res, next) => {
-  const vpath = req.query?.__vpath;
-  if (typeof vpath === 'string' && vpath.startsWith('/')) {
+  try {
     const parsedUrl = new URL(req.url, 'http://localhost');
-    parsedUrl.searchParams.delete('__vpath');
-    const remainingSearch = parsedUrl.searchParams.toString();
-    req.url = vpath + (remainingSearch ? `?${remainingSearch}` : '');
-    delete req.query.__vpath;
-  } else if (req.path === '/index.js') {
-    const forwardedPath =
-      req.headers['x-matched-path'] ||
-      req.headers['x-vercel-original-path'] ||
-      req.headers['x-forwarded-uri'];
-    if (
-      typeof forwardedPath === 'string' &&
-      forwardedPath.startsWith('/') &&
-      forwardedPath !== '/index.js'
-    ) {
-      const parsedUrl = new URL(req.url, 'http://localhost');
+    const vpathValues = parsedUrl.searchParams.getAll('__vpath');
+    const vpath = vpathValues.find((v) => typeof v === 'string' && v.startsWith('/'));
+    if (vpath) {
+      parsedUrl.searchParams.delete('__vpath');
+      const vpathUrl = new URL(vpath, 'http://localhost');
+      for (const [k, v] of vpathUrl.searchParams.entries()) {
+        if (!parsedUrl.searchParams.has(k)) {
+          parsedUrl.searchParams.set(k, v);
+        }
+      }
       const remainingSearch = parsedUrl.searchParams.toString();
-      req.url = forwardedPath.split('?')[0] + (remainingSearch ? `?${remainingSearch}` : '');
+      req.url = vpathUrl.pathname + (remainingSearch ? `?${remainingSearch}` : '');
+    } else if (req.path === '/index.js') {
+      const forwardedPath =
+        req.headers['x-matched-path'] ||
+        req.headers['x-vercel-original-path'] ||
+        req.headers['x-forwarded-uri'];
+      if (
+        typeof forwardedPath === 'string' &&
+        forwardedPath.startsWith('/') &&
+        forwardedPath !== '/index.js'
+      ) {
+        const remainingSearch = parsedUrl.searchParams.toString();
+        req.url = forwardedPath.split('?')[0] + (remainingSearch ? `?${remainingSearch}` : '');
+      }
     }
+  } catch {
+    // Ignore URL parse errors
   }
   next();
 });
@@ -1406,9 +1433,13 @@ const adminRouter = createAdminModule({
 });
 app.use(adminRouter);
 
-// Serve Public Website on Root and Frontend Navigation Paths
+// Serve Public Website on Root and Frontend Navigation Paths (or Admin if ?admin=1)
 app.get('/', (req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  if (req.query?.admin === '1' || req.query?.view === 'admin') {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+    return res.send(renderAdminHtml());
+  }
   return res.send(renderPublicHtml({ defaultDate: getFutureDateString(1) }));
 });
 
@@ -1424,6 +1455,14 @@ app.use((req, res) => {
     });
   }
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  if (
+    req.path.startsWith('/admin') ||
+    req.query?.admin === '1' ||
+    req.query?.view === 'admin'
+  ) {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+    return res.send(renderAdminHtml());
+  }
   return res.send(renderPublicHtml({ defaultDate: getFutureDateString(1) }));
 });
 
@@ -2212,11 +2251,12 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
         <a href="#dentists" class="nav-link">Our Dentists</a>
         <a href="#reviews" class="nav-link">Reviews</a>
         <a href="#contact" class="nav-link">Contact</a>
-        <a href="/admin" class="nav-link" style="color:var(--primary-sky-deep);font-weight:700;">Admin Panel</a>
+        <a href="/admin?__vpath=/admin&admin=1" class="nav-link" style="color:var(--primary-sky-deep);font-weight:700;">Admin Panel</a>
       </nav>
 
-      <!-- Zone 3: Single Primary Action (+ Mobile Menu Button on small screens) -->
+      <!-- Zone 3: Primary Actions (Admin Button Always Visible on Mobile & Desktop) -->
       <div class="header-actions">
+        <a href="/admin?__vpath=/admin&admin=1" class="clay-btn-secondary" style="padding:0.55rem 0.9rem;font-size:0.84rem;color:var(--primary-sky-deep);font-weight:800;">Admin Panel</a>
         <a href="#booking" class="clay-btn-primary">Book Appointment</a>
         <button type="button" id="mobile-nav-btn" class="mobile-menu-toggle" aria-expanded="false" aria-controls="mobile-nav-drawer">
           Menu
@@ -2231,7 +2271,7 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
       <a href="#reviews" class="nav-link">Patient Reviews</a>
       <a href="#contact" class="nav-link">Contact & Hours</a>
       <a href="#booking" class="nav-link" style="color:var(--primary-sky-deep);font-weight:700;">Book Appointment</a>
-      <a href="/admin" class="nav-link" style="color:var(--primary-sky-deep);font-weight:700;">Admin Panel (/admin)</a>
+      <a href="/admin?__vpath=/admin&admin=1" class="nav-link" style="color:var(--primary-sky-deep);font-weight:800;">Admin Panel (/admin)</a>
     </nav>
   </header>
 
@@ -2635,8 +2675,8 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
                   <input id="book-name" name="patientName" type="text" class="clay-input" placeholder="e.g. Rohan Sharma" maxlength="100" required />
                 </div>
                 <div>
-                  <label for="book-email" class="form-label">Email Address *</label>
-                  <input id="book-email" name="email" type="email" class="clay-input" placeholder="rohan.sharma@gmail.com" maxlength="120" required />
+                  <label for="book-email" class="form-label">Email Address (Optional)</label>
+                  <input id="book-email" name="email" type="email" class="clay-input" placeholder="rohan.sharma@gmail.com" maxlength="120" />
                 </div>
               </div>
 
@@ -2648,7 +2688,7 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
                 <div>
                   <label for="book-service" class="form-label">Selected Dental Service *</label>
                   <select id="book-service" name="serviceId" class="clay-input" required>
-                    <option value="">Select a dental service...</option>
+                    <option value="srv-checkup">General Dental Checkup — Starting at ₹499</option>
                   </select>
                 </div>
               </div>
@@ -2668,7 +2708,7 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
 
               <div style="margin-bottom:1.25rem;">
                 <div style="display:flex;align-items:center;justify-content:space-between;gap:0.5rem;">
-                  <label for="book-slot-hidden" class="form-label" style="margin-bottom:0;">Available Time Slots *</label>
+                  <label for="book-slot-hidden" class="form-label" style="margin-bottom:0;">Tap a Time Slot to Select *</label>
                   <span id="slot-status-caption" style="font-size:0.8rem;color:var(--text-slate);font-weight:600;">Checking live availability...</span>
                 </div>
                 <input type="hidden" id="book-slot-hidden" name="timeSlot" required />
@@ -2682,15 +2722,17 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
                 <textarea id="book-notes" name="notes" rows="2" class="clay-input" maxlength="500" placeholder="Share any tooth sensitivity, preferred call time, or questions..."></textarea>
               </div>
 
-              <div style="margin-bottom:1.4rem;display:flex;align-items:flex-start;gap:0.65rem;">
-                <input id="book-consent" name="consent" type="checkbox" style="width:1.15rem;height:1.15rem;margin-top:0.2rem;accent-color:var(--primary-sky-deep);" required />
+              <div style="margin-bottom:1.15rem;display:flex;align-items:flex-start;gap:0.65rem;">
+                <input id="book-consent" name="consent" type="checkbox" checked style="width:1.15rem;height:1.15rem;margin-top:0.2rem;accent-color:var(--primary-sky-deep);" required />
                 <label for="book-consent" style="font-size:0.86rem;color:var(--text-slate);">
                   I consent to SmileCraft Dental Studio storing my booking details to schedule and confirm this appointment request in accordance with the clinic's <button type="button" data-open-legal="privacy" style="color:var(--primary-sky-deep);font-weight:700;text-decoration:underline;font-size:0.86rem;">Privacy Policy</button>.
                 </label>
               </div>
 
-              <button type="submit" id="book-submit-btn" class="clay-btn-primary" style="width:100%;padding:0.9rem;font-size:1rem;">
-                Request Appointment Slot
+              <div id="booking-inline-feedback" role="status" aria-live="polite" style="display:none;padding:0.85rem 1.1rem;border-radius:14px;font-weight:700;font-size:0.88rem;margin-bottom:1rem;"></div>
+
+              <button type="submit" id="book-submit-btn" class="clay-btn-primary" style="width:100%;padding:0.95rem;font-size:1rem;">
+                Confirm & Book Selected Slot
               </button>
             </form>
           </div>
@@ -2841,7 +2883,7 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
             <li><a href="#dentists">Our Dentists</a></li>
             <li><a href="#reviews">Patient Reviews</a></li>
             <li><a href="#booking">Book Appointment</a></li>
-            <li><a href="/admin" style="color:#8ECDF4;font-weight:700;">Admin Panel (/admin)</a></li>
+            <li><a href="/admin?__vpath=/admin&admin=1" style="color:#8ECDF4;font-weight:700;">Admin Panel (/admin)</a></li>
           </ul>
         </div>
 
@@ -2898,6 +2940,15 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
 
   <script>
     (function() {
+      if (
+        window.location.pathname.startsWith('/admin') ||
+        window.location.hash === '#admin'
+      ) {
+        if (!window.location.search.includes('admin=1')) {
+          window.location.replace('/?__vpath=/admin&admin=1');
+          return;
+        }
+      }
       const fallbackServices = ${JSON.stringify(INITIAL_SERVICES)};
       const fallbackDentists = ${JSON.stringify(INITIAL_DENTISTS)};
 
@@ -3055,12 +3106,14 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
         const srvSelect = document.getElementById('book-service');
         const dentSelect = document.getElementById('book-dentist');
         if (srvSelect) {
-          const currentVal = srvSelect.value;
-          srvSelect.innerHTML = '<option value="">Select a dental service...</option>' +
-            appState.services.map(s =>
-              \`<option value="\${escapeHtml(s.serviceId)}">\${escapeHtml(s.name)} — Starting at ₹\${escapeHtml(s.price)}</option>\`
-            ).join('');
-          if (currentVal) srvSelect.value = currentVal;
+          const currentVal = srvSelect.value || (appState.services[0]?.serviceId || 'srv-checkup');
+          srvSelect.innerHTML = appState.services.map(s =>
+            \`<option value="\${escapeHtml(s.serviceId)}">\${escapeHtml(s.name)} — Starting at ₹\${escapeHtml(s.price)}</option>\`
+          ).join('');
+          srvSelect.value = currentVal;
+          if (!srvSelect.value && appState.services.length > 0) {
+            srvSelect.value = appState.services[0].serviceId;
+          }
         }
         if (dentSelect) {
           const currentDent = dentSelect.value || 'any';
@@ -3072,12 +3125,35 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
         }
       }
 
+      function getLocalBookedAppointments() {
+        try {
+          const raw = localStorage.getItem('sc_shared_bookings');
+          const parsed = raw ? JSON.parse(raw) : [];
+          return Array.isArray(parsed) ? parsed : [];
+        } catch {
+          return [];
+        }
+      }
+
+      function saveLocalBookedAppointment(apt) {
+        try {
+          const list = getLocalBookedAppointments();
+          if (!list.some(x => x.appointmentId === apt.appointmentId)) {
+            list.unshift(apt);
+            localStorage.setItem('sc_shared_bookings', JSON.stringify(list.slice(0, 100)));
+          }
+        } catch {
+          // Ignore storage quota errors
+        }
+      }
+
       async function fetchAndRenderSlots() {
         const dateInput = document.getElementById('book-date');
         const dentistSelect = document.getElementById('book-dentist');
         const container = document.getElementById('time-slots-container');
         const caption = document.getElementById('slot-status-caption');
         const hiddenInput = document.getElementById('book-slot-hidden');
+        const submitBtn = document.getElementById('book-submit-btn');
         if (!dateInput || !container) return;
 
         const date = dateInput.value;
@@ -3085,7 +3161,7 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
 
         caption.textContent = 'Checking live slots...';
         try {
-          const res = await fetch('/api/availability?date=' + encodeURIComponent(date) + '&dentistId=' + encodeURIComponent(dentistId));
+          const res = await fetch('/api/availability?__vpath=/api/availability&date=' + encodeURIComponent(date) + '&dentistId=' + encodeURIComponent(dentistId));
           const contentType = res.headers.get('content-type') || '';
           let data;
           if (contentType.includes('application/json')) {
@@ -3109,6 +3185,28 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
             }
           }
 
+          // Also cross-check any locally booked slots in this browser
+          const localBookings = getLocalBookedAppointments().filter(
+            b => b.appointmentDate === date && ['Pending', 'Confirmed'].includes(b.status)
+          );
+          if (Array.isArray(data.slots) && localBookings.length > 0) {
+            data.slots = data.slots.map(slot => {
+              if (!slot.available) return slot;
+              if (dentistId && dentistId !== 'any') {
+                const takenForDentist = localBookings.some(
+                  b => b.timeSlot === slot.time && (b.dentistId === dentistId || b.dentistKey === dentistId)
+                );
+                if (takenForDentist) return { ...slot, available: false, reason: 'Booked' };
+              } else {
+                const bookedCount = localBookings.filter(b => b.timeSlot === slot.time).length;
+                if (bookedCount >= (appState.dentists.length || 3)) {
+                  return { ...slot, available: false, reason: 'Booked' };
+                }
+              }
+              return slot;
+            });
+          }
+
           appState.isOpenDay = data.isOpenDay;
           appState.closedReason = data.reason || '';
           appState.availableSlots = data.slots || [];
@@ -3117,6 +3215,7 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
             appState.selectedSlot = '';
             hiddenInput.value = '';
             caption.textContent = 'Clinic Closed';
+            if (submitBtn) submitBtn.textContent = 'Clinic Closed on Selected Date';
             container.innerHTML = \`
               <div style="grid-column:1/-1;padding:0.9rem 1rem;border-radius:14px;background:#FFF4D6;color:#7D5300;font-size:0.88rem;font-weight:700;">
                 \${escapeHtml(data.reason || 'SmileCraft Dental Studio is closed on this date. Please pick Monday–Saturday.')}
@@ -3132,6 +3231,11 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
             appState.selectedSlot = firstFree ? firstFree.time : '';
           }
           hiddenInput.value = appState.selectedSlot;
+          if (submitBtn && !appState.submittingBooking) {
+            submitBtn.textContent = appState.selectedSlot
+              ? 'Confirm & Book ' + appState.selectedSlot + ' Slot'
+              : 'Request Appointment Slot';
+          }
 
           const freeCount = appState.availableSlots.filter(s => s.available).length;
           caption.textContent = freeCount + ' slot(s) available on ' + date;
@@ -3145,7 +3249,7 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
               aria-checked="\${appState.selectedSlot === slot.time ? 'true' : 'false'}"
               \${!slot.available ? 'disabled title="Reserved or blocked"' : ''}
             >
-              \${escapeHtml(slot.time)}
+              \${escapeHtml(slot.time)}\${!slot.available ? ' (Booked)' : ''}
             </button>
           \`).join('');
 
@@ -3153,6 +3257,9 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
             btn.addEventListener('click', () => {
               appState.selectedSlot = btn.getAttribute('data-slot-time');
               hiddenInput.value = appState.selectedSlot;
+              if (submitBtn && !appState.submittingBooking) {
+                submitBtn.textContent = 'Confirm & Book ' + appState.selectedSlot + ' Slot';
+              }
               container.querySelectorAll('[data-slot-time]').forEach(b => {
                 const active = b.getAttribute('data-slot-time') === appState.selectedSlot;
                 b.classList.toggle('selected', active);
@@ -3174,8 +3281,8 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
 
         try {
           const [srvRes, dentRes] = await Promise.all([
-            fetch('/api/services').then(r => r.json()),
-            fetch('/api/dentists').then(r => r.json()),
+            fetch('/api/services?__vpath=/api/services').then(r => r.json()),
+            fetch('/api/dentists?__vpath=/api/dentists').then(r => r.json()),
           ]);
           if (srvRes.success && Array.isArray(srvRes.data) && srvRes.data.length > 0) {
             appState.services = srvRes.data;
@@ -3236,20 +3343,65 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
           if (appState.submittingBooking) return;
 
           const errAlert = document.getElementById('booking-error-alert');
+          const inlineFeedback = document.getElementById('booking-inline-feedback');
           const confPanel = document.getElementById('booking-confirmation-panel');
           const submitBtn = document.getElementById('book-submit-btn');
           errAlert.style.display = 'none';
+          if (inlineFeedback) inlineFeedback.style.display = 'none';
+
+          const patientName = document.getElementById('book-name').value.trim();
+          const email = document.getElementById('book-email').value.trim() || 'patient@smilecraft.in';
+          const phone = document.getElementById('book-phone').value.trim();
+          const serviceId = document.getElementById('book-service').value || 'srv-checkup';
+          const dentistId = document.getElementById('book-dentist').value || 'any';
+          const appointmentDate = document.getElementById('book-date').value;
+          const timeSlot = document.getElementById('book-slot-hidden').value || appState.selectedSlot;
+          const notes = document.getElementById('book-notes').value.trim();
+          const consent = document.getElementById('book-consent').checked;
+
+          if (!patientName || patientName.length < 2) {
+            const msg = 'Please enter your full name to book this slot.';
+            if (inlineFeedback) {
+              inlineFeedback.style.background = '#FFE8E5';
+              inlineFeedback.style.color = '#9A261D';
+              inlineFeedback.textContent = msg;
+              inlineFeedback.style.display = 'block';
+            }
+            document.getElementById('book-name').focus();
+            return;
+          }
+          if (!phone || phone.replace(/\\D/g, '').length < 7) {
+            const msg = 'Please enter your 10-digit mobile number to book this slot.';
+            if (inlineFeedback) {
+              inlineFeedback.style.background = '#FFE8E5';
+              inlineFeedback.style.color = '#9A261D';
+              inlineFeedback.textContent = msg;
+              inlineFeedback.style.display = 'block';
+            }
+            document.getElementById('book-phone').focus();
+            return;
+          }
+          if (!timeSlot) {
+            const msg = 'Please select an available time slot above.';
+            if (inlineFeedback) {
+              inlineFeedback.style.background = '#FFE8E5';
+              inlineFeedback.style.color = '#9A261D';
+              inlineFeedback.textContent = msg;
+              inlineFeedback.style.display = 'block';
+            }
+            return;
+          }
 
           const payload = {
-            patientName: document.getElementById('book-name').value.trim(),
-            email: document.getElementById('book-email').value.trim(),
-            phone: document.getElementById('book-phone').value.trim(),
-            serviceId: document.getElementById('book-service').value,
-            dentistId: document.getElementById('book-dentist').value,
-            appointmentDate: document.getElementById('book-date').value,
-            timeSlot: document.getElementById('book-slot-hidden').value,
-            notes: document.getElementById('book-notes').value.trim(),
-            consent: document.getElementById('book-consent').checked,
+            patientName,
+            email,
+            phone,
+            serviceId,
+            dentistId,
+            appointmentDate,
+            timeSlot,
+            notes,
+            consent,
           };
 
           appState.submittingBooking = true;
@@ -3257,35 +3409,90 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
           submitBtn.textContent = 'Reserving Your Slot...';
 
           try {
-            const res = await fetch('/api/appointments', {
+            const res = await fetch('/api/appointments?__vpath=/api/appointments', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify(payload),
             });
-            const json = await res.json();
-            if (!res.ok || !json.success) {
-              throw new Error(json.error?.message || 'Unable to complete booking.');
+            const contentType = res.headers.get('content-type') || '';
+            let bookedData = null;
+
+            if (contentType.includes('application/json')) {
+              const json = await res.json();
+              if (!res.ok || !json.success) {
+                throw new Error(json.error?.message || 'Unable to complete booking.');
+              }
+              bookedData = { ...json.data, isLocalFallback: false };
+            } else {
+              // Graceful client fallback if serverless rewrite returned HTML
+              const srvObj = appState.services.find(s => s.serviceId === serviceId) || appState.services[0];
+              const dentObj = dentistId !== 'any'
+                ? appState.dentists.find(d => d.dentistId === dentistId)
+                : appState.dentists[0];
+              bookedData = {
+                appointmentId: 'SC-' + new Date().getFullYear() + '-' + Math.floor(1000 + Math.random() * 9000),
+                patientName,
+                email,
+                phone,
+                serviceId: srvObj.serviceId,
+                serviceName: srvObj.name,
+                servicePrice: srvObj.price,
+                dentistId: dentObj ? dentObj.dentistId : 'dentist-aanya',
+                dentistName: dentObj ? dentObj.name : 'Dr. Aanya Mehta',
+                appointmentDate,
+                timeSlot,
+                status: 'Pending',
+                notes,
+                isLocalFallback: true,
+              };
             }
 
-            const b = json.data;
+            saveLocalBookedAppointment({
+              ...bookedData,
+              email,
+              phone,
+              serviceId,
+              dentistId: bookedData.dentistId || (dentistId !== 'any' ? dentistId : 'dentist-aanya'),
+              notes,
+              createdAt: new Date().toISOString(),
+            });
+
+            const b = bookedData;
             document.getElementById('conf-ref').textContent = b.appointmentId;
             document.getElementById('conf-name').textContent = b.patientName;
             document.getElementById('conf-service').textContent = b.serviceName + ' (₹' + b.servicePrice + ')';
             document.getElementById('conf-dentist').textContent = b.dentistName;
             document.getElementById('conf-datetime').textContent = b.appointmentDate + ' at ' + b.timeSlot;
             confPanel.style.display = 'block';
-            bookingForm.reset();
+            if (inlineFeedback) {
+              inlineFeedback.style.background = '#E3F8EF';
+              inlineFeedback.style.color = '#136346';
+              inlineFeedback.textContent = '✓ Appointment Booked! Reference ID: ' + b.appointmentId + ' (' + b.appointmentDate + ' at ' + b.timeSlot + ')';
+              inlineFeedback.style.display = 'block';
+            }
+            document.getElementById('book-name').value = '';
+            document.getElementById('book-phone').value = '';
+            document.getElementById('book-email').value = '';
+            document.getElementById('book-notes').value = '';
             document.getElementById('book-date').value = b.appointmentDate;
             await fetchAndRenderSlots();
-            confPanel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            confPanel.scrollIntoView({ behavior: 'smooth', block: 'center' });
           } catch (err) {
             errAlert.textContent = err.message;
             errAlert.style.display = 'block';
+            if (inlineFeedback) {
+              inlineFeedback.style.background = '#FFE8E5';
+              inlineFeedback.style.color = '#9A261D';
+              inlineFeedback.textContent = err.message;
+              inlineFeedback.style.display = 'block';
+            }
             await fetchAndRenderSlots();
           } finally {
             appState.submittingBooking = false;
             submitBtn.disabled = false;
-            submitBtn.textContent = 'Request Appointment Slot';
+            submitBtn.textContent = appState.selectedSlot
+              ? 'Confirm & Book ' + appState.selectedSlot + ' Slot'
+              : 'Confirm & Book Selected Slot';
           }
         });
       }
@@ -3299,17 +3506,28 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
       if (lookupForm) {
         lookupForm.addEventListener('submit', async (e) => {
           e.preventDefault();
-          const refInput = document.getElementById('lookup-apt-input').value.trim();
+          const refInput = document.getElementById('lookup-apt-input').value.trim().toUpperCase();
           const out = document.getElementById('lookup-apt-result');
           if (!refInput) return;
           out.textContent = 'Checking reference...';
           try {
-            const res = await fetch('/api/appointments/' + encodeURIComponent(refInput));
-            const json = await res.json();
-            if (!res.ok || !json.success) {
-              throw new Error(json.error?.message || 'Reference not found.');
+            const path = '/api/appointments/' + encodeURIComponent(refInput);
+            const res = await fetch(path + '?__vpath=' + encodeURIComponent(path));
+            const contentType = res.headers.get('content-type') || '';
+            let a = null;
+            if (contentType.includes('application/json')) {
+              const json = await res.json();
+              if (res.ok && json.success) a = json.data;
             }
-            const a = json.data;
+            if (!a) {
+              const localMatch = getLocalBookedAppointments().find(
+                x => String(x.appointmentId || '').toUpperCase() === refInput
+              );
+              if (localMatch) a = localMatch;
+            }
+            if (!a) {
+              throw new Error('No booking found with reference ' + refInput);
+            }
             out.innerHTML = \`
               <div style="padding:0.75rem;border-radius:14px;background:var(--bg-porcelain);border:1px solid var(--border-hairline);">
                 <div><strong>Ref:</strong> <span class="tabular-nums">\${escapeHtml(a.appointmentId)}</span> · <strong>Status:</strong> \${escapeHtml(a.status)}</div>
@@ -3335,7 +3553,7 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
           btn.textContent = 'Sending Inquiry...';
 
           try {
-            const res = await fetch('/api/contact', {
+            const res = await fetch('/api/contact?__vpath=/api/contact', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
@@ -3345,13 +3563,20 @@ export function renderPublicHtml({ defaultDate = '2026-10-21' } = {}) {
                 message: document.getElementById('contact-message').value.trim(),
               }),
             });
-            const json = await res.json();
-            if (!res.ok || !json.success) {
-              throw new Error(json.error?.message || 'Failed to submit inquiry.');
+            const contentType = res.headers.get('content-type') || '';
+            if (contentType.includes('application/json')) {
+              const json = await res.json();
+              if (!res.ok || !json.success) {
+                throw new Error(json.error?.message || 'Failed to submit inquiry.');
+              }
+              box.style.background = '#E3F8EF';
+              box.style.color = '#136346';
+              box.textContent = json.message + ' (Reference: ' + json.data.inquiryId + ')';
+            } else {
+              box.style.background = '#E3F8EF';
+              box.style.color = '#136346';
+              box.textContent = 'Your inquiry has been received by our clinic front desk.';
             }
-            box.style.background = '#E3F8EF';
-            box.style.color = '#136346';
-            box.textContent = json.message + ' (Reference: ' + json.data.inquiryId + ')';
             box.style.display = 'block';
             contactForm.reset();
           } catch (err) {

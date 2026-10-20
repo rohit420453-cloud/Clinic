@@ -2037,7 +2037,11 @@ export function renderAdminHtml() {
         if (state.csrfToken) headers['X-CSRF-Token'] = state.csrfToken;
         if (state.bearerToken) headers['Authorization'] = 'Bearer ' + state.bearerToken;
 
-        const response = await fetch(url, Object.assign({}, options, {
+        const parsed = new URL(url, window.location.origin);
+        parsed.searchParams.set('__vpath', parsed.pathname);
+        const requestUrl = parsed.pathname + '?' + parsed.searchParams.toString();
+
+        const response = await fetch(requestUrl, Object.assign({}, options, {
           headers,
           credentials: 'same-origin',
         }));
@@ -2086,7 +2090,36 @@ export function renderAdminHtml() {
         }
       }
 
+      async function syncLocalBookingsToServer() {
+        try {
+          const raw = localStorage.getItem('sc_shared_bookings');
+          const list = raw ? JSON.parse(raw) : [];
+          if (!Array.isArray(list) || list.length === 0) return;
+          for (const b of list) {
+            if (!b || !b.isLocalFallback || !b.patientName || !b.appointmentDate || !b.timeSlot) continue;
+            await apiFetch('/api/admin/appointments', {
+              method: 'POST',
+              body: JSON.stringify({
+                patientName: b.patientName,
+                email: b.email || 'patient@smilecraft.in',
+                phone: b.phone || '+91 98765 43210',
+                serviceId: b.serviceId || 'srv-checkup',
+                dentistId: b.dentistId || 'dentist-aanya',
+                appointmentDate: b.appointmentDate,
+                timeSlot: b.timeSlot,
+                status: b.status || 'Pending',
+                notes: b.notes || 'Booked online via public website.',
+              }),
+            }).catch(() => {});
+          }
+          localStorage.removeItem('sc_shared_bookings');
+        } catch {
+          // Ignore sync errors
+        }
+      }
+
       async function loadInitialAdminData() {
+        await syncLocalBookingsToServer();
         const [dashRes, srvRes, dentRes] = await Promise.all([
           apiFetch('/api/admin/dashboard'),
           apiFetch('/api/admin/services'),
